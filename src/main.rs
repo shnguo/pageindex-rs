@@ -6,9 +6,12 @@ use lopdf::Document;
 use reqwest::Client;
 use serde::{ Deserialize, Serialize };
 use std::path::{ Path, PathBuf };
+use sha2::{ Digest, Sha256 };
+use std::fs::File;
+use std::io::{ BufReader, Read };
 
 mod db;
-use db::LibraryIndex;
+use db::{ LibraryIndex, HashCheckResult };
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -163,11 +166,16 @@ async fn insert_nodes_recursively(
     pdf_doc: &Document
 ) -> Result<(), anyhow::Error> {
     for node in nodes {
-        let unique_node_id = format!("{}_{}", db_doc_id, node.node_id);
+        let unique_node_id = format!(
+            "{}_{}_{}",
+            db_doc_id,
+            parent_id.unwrap_or("root"),
+            node.node_id
+        );
 
         let child_ids: Vec<String> = node.nodes
             .iter()
-            .map(|c| format!("{}_{}", db_doc_id, c.node_id))
+            .map(|c| format!("{}_{}_{}", db_doc_id, unique_node_id, c.node_id))
             .collect();
 
         let content = extract_pdf_text(pdf_doc, node.start_index, node.end_index);
@@ -380,6 +388,39 @@ async fn main() -> Result<()> {
         anyhow::bail!("PDF file not found: {:?}", args.pdf_path);
     }
 
+    let absolute_path_str = match std::fs::canonicalize(&args.pdf_path) {
+        Ok(path) => path.to_string_lossy().to_string(),
+        Err(_) => args.pdf_path.to_string_lossy().to_string(),
+    };
+
+    println!("Calculating SHA-256 hash for document...");
+    let mut file = File::open(&args.pdf_path).context("Failed to open PDF for hashing")?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; 8192];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let file_hash = format!("{:x}", hasher.finalize());
+    println!("Document Hash: {}", file_hash);
+
+    match db.check_document_hash(&absolute_path_str, &file_hash).await? {
+        HashCheckResult::Match => {
+            println!("✅ Document is unchanged. Skipping extraction.");
+            return Ok(());
+        }
+        HashCheckResult::Mismatch(old_doc_id) => {
+            println!("🔄 Document has been modified. Pruning old data (ID: {})...", old_doc_id);
+            db.prune_document(&old_doc_id).await.context("Failed to prune old document")?;
+        }
+        HashCheckResult::NotFound => {
+            println!("📄 New document detected. Proceeding with extraction.");
+        }
+    }
+
     let doc = Document::load(&args.pdf_path).context(
         "Failed to load PDF to determine total pages"
     )?;
@@ -427,16 +468,12 @@ async fn main() -> Result<()> {
         None
     };
 
-    let absolute_path = match std::fs::canonicalize(&args.pdf_path) {
-        Ok(path) => Some(path.to_string_lossy().to_string()),
-        Err(_) => Some(args.pdf_path.to_string_lossy().to_string()),
-    };
-
     db.insert_document(
         &db_doc_id,
         doc_title,
         overall_summary.as_deref(),
-        absolute_path.as_deref()
+        Some(&absolute_path_str),
+        Some(&file_hash)
     ).await?;
     insert_nodes_recursively(&db, &db_doc_id, None, &root_nodes, &doc).await?;
     println!("Saved to database successfully.");

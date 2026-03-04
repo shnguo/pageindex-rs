@@ -8,6 +8,13 @@ pub struct DocumentSummary {
     pub title: String,
     pub overall_summary: Option<String>,
     pub file_path: Option<String>,
+    pub file_hash: Option<String>,
+}
+
+pub enum HashCheckResult {
+    Match,
+    Mismatch(String), // Returns the old document ID so we can prune it
+    NotFound,
 }
 
 #[derive(Serialize, Deserialize, sqlx::FromRow, Debug)]
@@ -46,6 +53,7 @@ impl LibraryIndex {
                 title TEXT NOT NULL,
                 overall_summary TEXT,
                 file_path TEXT,
+                file_hash TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -76,17 +84,48 @@ impl LibraryIndex {
         id: &str,
         title: &str,
         summary: Option<&str>,
-        file_path: Option<&str>
+        file_path: Option<&str>,
+        file_hash: Option<&str>
     ) -> Result<(), sqlx::Error> {
         sqlx
             ::query(
-                "INSERT INTO documents (id, title, overall_summary, file_path) VALUES (?, ?, ?, ?)"
+                "INSERT INTO documents (id, title, overall_summary, file_path, file_hash) VALUES (?, ?, ?, ?, ?)"
             )
             .bind(id)
             .bind(title)
             .bind(summary)
             .bind(file_path)
+            .bind(file_hash)
             .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn check_document_hash(
+        &self,
+        absolute_file_path: &str,
+        new_hash: &str
+    ) -> Result<HashCheckResult, sqlx::Error> {
+        let record = sqlx
+            ::query_as::<_, (String, Option<String>)>(
+                "SELECT id, file_hash FROM documents WHERE file_path = ?"
+            )
+            .bind(absolute_file_path)
+            .fetch_optional(&self.pool).await?;
+
+        match record {
+            Some((id, file_hash)) => {
+                if file_hash.as_deref() == Some(new_hash) {
+                    Ok(HashCheckResult::Match)
+                } else {
+                    Ok(HashCheckResult::Mismatch(id))
+                }
+            }
+            None => Ok(HashCheckResult::NotFound),
+        }
+    }
+
+    pub async fn prune_document(&self, doc_id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM documents WHERE id = ?").bind(doc_id).execute(&self.pool).await?;
         Ok(())
     }
 
