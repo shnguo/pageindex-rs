@@ -27,7 +27,9 @@ To support this low-latency, recursive point-lookup traversal pattern, this proj
   - Analyzes long PDFs by breaking them down recursively based on maximum depth limits.
   - LLM Self-Determination: The model flags if a text block contains distinct subdivisions (`has_children: true`).
 - **In-Memory PDF Slicing with Text Extraction**: Uses the `lopdf` crate to dynamically slice massive PDFs into targeted byte blocks for LLM structure reasoning, while simultaneously extracting the raw text for the SQLite database.
-- **SQLite Persistence**: Automatically provisions and populates a relational database capable of serving advanced multi-agent RAG patterns.
+- **SQLite Persistence & Auto-Pruning**:
+  - Automatically provisions and populates a relational database capable of serving advanced multi-agent RAG patterns.
+  - Records the absolute path of the source PDF. If an agent attempts to drill down into a document that has been moved or deleted from the server, the database safely self-prunes the entire associated tree to prevent hallucinations.
 
 ## Usage
 
