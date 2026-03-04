@@ -7,6 +7,7 @@ pub struct DocumentSummary {
     pub id: String,
     pub title: String,
     pub overall_summary: Option<String>,
+    pub file_path: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, sqlx::FromRow, Debug)]
@@ -44,6 +45,7 @@ impl LibraryIndex {
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
                 overall_summary TEXT,
+                file_path TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -73,13 +75,17 @@ impl LibraryIndex {
         &self,
         id: &str,
         title: &str,
-        summary: Option<&str>
+        summary: Option<&str>,
+        file_path: Option<&str>
     ) -> Result<(), sqlx::Error> {
         sqlx
-            ::query("INSERT INTO documents (id, title, overall_summary) VALUES (?, ?, ?)")
+            ::query(
+                "INSERT INTO documents (id, title, overall_summary, file_path) VALUES (?, ?, ?, ?)"
+            )
             .bind(id)
             .bind(title)
             .bind(summary)
+            .bind(file_path)
             .execute(&self.pool).await?;
         Ok(())
     }
@@ -120,7 +126,9 @@ impl LibraryIndex {
     #[allow(dead_code)]
     pub async fn list_documents(&self) -> Result<Vec<DocumentSummary>, sqlx::Error> {
         let docs = sqlx
-            ::query_as::<_, DocumentSummary>("SELECT id, title, overall_summary FROM documents")
+            ::query_as::<_, DocumentSummary>(
+                "SELECT id, title, overall_summary, file_path FROM documents"
+            )
             .fetch_all(&self.pool).await?;
         Ok(docs)
     }
@@ -176,13 +184,59 @@ impl LibraryIndex {
     }
 
     #[allow(dead_code)]
-    pub async fn read_node_content(&self, node_id: &str) -> Result<NodeContent, sqlx::Error> {
-        let content = sqlx
-            ::query_as::<_, NodeContent>(
-                "SELECT node_id, title, content FROM document_nodes WHERE node_id = ?"
+    pub async fn read_node_content(
+        &self,
+        node_id: &str
+    ) -> Result<Option<NodeContent>, anyhow::Error> {
+        #[derive(sqlx::FromRow)]
+        struct JoinedNode {
+            doc_id: String,
+            file_path: Option<String>,
+            node_id: String,
+            title: String,
+            content: Option<String>,
+        }
+
+        // First check if the file still exists by joining back to the documents table
+        let record = sqlx
+            ::query_as::<_, JoinedNode>(
+                "SELECT d.id as doc_id, d.file_path, n.node_id, n.title, n.content 
+             FROM document_nodes n 
+             JOIN documents d ON n.document_id = d.id 
+             WHERE n.node_id = ?"
             )
             .bind(node_id)
-            .fetch_one(&self.pool).await?;
-        Ok(content)
+            .fetch_optional(&self.pool).await?;
+
+        if let Some(row) = record {
+            if let Some(file_path_str) = row.file_path {
+                let file_path = std::path::Path::new(&file_path_str);
+
+                // If the file is missing, prune the document from the database (CASCADE deletes nodes)
+                if !file_path.exists() {
+                    println!(
+                        "Warning: Associated PDF file {} is missing. Pruning document {} from database.",
+                        file_path_str,
+                        row.doc_id
+                    );
+                    sqlx
+                        ::query("DELETE FROM documents WHERE id = ?")
+                        .bind(row.doc_id)
+                        .execute(&self.pool).await?;
+
+                    return Ok(None);
+                }
+            }
+
+            return Ok(
+                Some(NodeContent {
+                    node_id: row.node_id,
+                    title: row.title,
+                    content: row.content,
+                })
+            );
+        }
+
+        Ok(None)
     }
 }

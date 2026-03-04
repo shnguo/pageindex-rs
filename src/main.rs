@@ -427,7 +427,17 @@ async fn main() -> Result<()> {
         None
     };
 
-    db.insert_document(&db_doc_id, doc_title, overall_summary.as_deref()).await?;
+    let absolute_path = match std::fs::canonicalize(&args.pdf_path) {
+        Ok(path) => Some(path.to_string_lossy().to_string()),
+        Err(_) => Some(args.pdf_path.to_string_lossy().to_string()),
+    };
+
+    db.insert_document(
+        &db_doc_id,
+        doc_title,
+        overall_summary.as_deref(),
+        absolute_path.as_deref()
+    ).await?;
     insert_nodes_recursively(&db, &db_doc_id, None, &root_nodes, &doc).await?;
     println!("Saved to database successfully.");
 
