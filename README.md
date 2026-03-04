@@ -29,7 +29,8 @@ To support this low-latency, recursive point-lookup traversal pattern, this proj
 - **In-Memory PDF Slicing with Text Extraction**: Uses the `lopdf` crate to dynamically slice massive PDFs into targeted byte blocks for LLM structure reasoning, while simultaneously extracting the raw text for the SQLite database.
 - **SQLite Persistence & Auto-Pruning**:
   - Automatically provisions and populates a relational database capable of serving advanced multi-agent RAG patterns.
-  - Records the absolute path of the source PDF. If an agent attempts to drill down into a document that has been moved or deleted from the server, the database safely self-prunes the entire associated tree to prevent hallucinations.
+  - **Auto-Pruning**: Records the absolute path of the source PDF. If an agent attempts to drill down into a document that has been moved or deleted from the server, the database safely self-prunes the entire associated tree to prevent hallucinations.
+  - **Modification Tracking**: Computes the SHA-256 hash of the PDF file before extraction. Unmodified files are instantly skipped to save API costs. Modified files instantly trigger a prune and re-extraction, ensuring perfect synchronization.
 
 ## Usage
 
