@@ -1,7 +1,7 @@
 use anyhow::{ Context, Result };
 use async_recursion::async_recursion;
 use base64::{ engine::general_purpose, Engine as _ };
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use lopdf::Document;
 use reqwest::Client;
 use serde::{ Deserialize, Serialize };
@@ -15,18 +15,35 @@ use db::{ LibraryIndex, HashCheckResult };
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
-struct Args {
-    #[arg(short, long)]
-    pdf_path: PathBuf,
-
-    #[arg(long, default_value_t = 3)]
-    max_depth: usize,
-
-    #[arg(long, default_value_t = 5)]
-    min_pages: usize,
-
+struct Cli {
     #[arg(long, default_value = "sqlite:pageindex.db?mode=rwc")]
     db_url: String,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Parse and index a new PDF document into the database
+    Index {
+        #[arg(short, long)]
+        pdf_path: PathBuf,
+
+        #[arg(long, default_value_t = 3)]
+        max_depth: usize,
+
+        #[arg(long, default_value_t = 5)]
+        min_pages: usize,
+    },
+    /// Search documents by keyword in their summary
+    Search {
+        keyword: String,
+    },
+    /// Get top level nodes for a document
+    TopNodes {
+        document_id: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -502,37 +519,18 @@ async fn process_pdf_chunk(
     Ok(nodes)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber
-        ::fmt()
-        .with_writer(std::io::stdout)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter
-                ::from_default_env()
-                .add_directive(tracing::Level::INFO.into())
-        )
-        .init();
-
-    dotenvy::dotenv().ok();
-    let api_key = std::env::var("GEMINI_API_KEY").context("GEMINI_API_KEY not found in .env")?;
-
-    let args = Args::parse();
-
-    let db = LibraryIndex::new(&args.db_url).await.context("Failed to connect to database")?;
-    db.init_tables().await.context("Failed to initialize database tables")?;
-
-    if !args.pdf_path.exists() {
-        anyhow::bail!("PDF file not found: {:?}", args.pdf_path);
+async fn run_index(db: &LibraryIndex, api_key: &str, pdf_path: PathBuf, max_depth: usize, min_pages: usize) -> Result<()> {
+    if !pdf_path.exists() {
+        anyhow::bail!("PDF file not found: {:?}", pdf_path);
     }
 
-    let absolute_path_str = match std::fs::canonicalize(&args.pdf_path) {
+    let absolute_path_str = match std::fs::canonicalize(&pdf_path) {
         Ok(path) => path.to_string_lossy().to_string(),
-        Err(_) => args.pdf_path.to_string_lossy().to_string(),
+        Err(_) => pdf_path.to_string_lossy().to_string(),
     };
 
     info!("Calculating SHA-256 hash for document...");
-    let mut file = File::open(&args.pdf_path).context("Failed to open PDF for hashing")?;
+    let mut file = File::open(&pdf_path).context("Failed to open PDF for hashing")?;
     let mut hasher = Sha256::new();
     let mut buffer = [0; 8192];
     loop {
@@ -559,25 +557,25 @@ async fn main() -> Result<()> {
         }
     }
 
-    let doc = Document::load(&args.pdf_path).context(
+    let doc = Document::load(&pdf_path).context(
         "Failed to load PDF to determine total pages"
     )?;
     let total_pages = doc.get_pages().len();
 
-    info!("Starting recursive extraction on {:?} ({} pages)", args.pdf_path, total_pages);
-    info!("Limits: Max Depth={}, Min Pages={}", args.max_depth, args.min_pages);
+    info!("Starting recursive extraction on {:?} ({} pages)", pdf_path, total_pages);
+    info!("Limits: Max Depth={}, Min Pages={}", max_depth, min_pages);
 
     let client = Client::new();
 
     let root_nodes = process_pdf_chunk(
         &client,
-        &api_key,
-        &args.pdf_path,
+        api_key,
+        &pdf_path,
         1,
         total_pages,
         0,
-        args.max_depth,
-        args.min_pages
+        max_depth,
+        min_pages
     ).await?;
 
     info!("\n==================================");
@@ -588,7 +586,7 @@ async fn main() -> Result<()> {
 
     info!("\nSaving to database...");
     let db_doc_id = uuid::Uuid::new_v4().to_string();
-    let doc_title = args.pdf_path
+    let doc_title = pdf_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("Unknown Document");
@@ -613,8 +611,80 @@ async fn main() -> Result<()> {
         Some(&absolute_path_str),
         Some(&file_hash)
     ).await?;
-    insert_nodes_recursively(&client, &db, &db_doc_id, None, &root_nodes, &args.pdf_path).await?;
+    insert_nodes_recursively(&client, db, &db_doc_id, None, &root_nodes, &pdf_path).await?;
     info!("Saved to database successfully.");
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber
+        ::fmt()
+        .with_writer(std::io::stdout)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter
+                ::from_default_env()
+                .add_directive(tracing::Level::INFO.into())
+        )
+        .init();
+
+    dotenvy::dotenv().ok();
+    
+    let cli = Cli::parse();
+
+    let db = LibraryIndex::new(&cli.db_url).await.context("Failed to connect to database")?;
+    db.init_tables().await.context("Failed to initialize database tables")?;
+
+    match cli.command {
+        Commands::Index { pdf_path, max_depth, min_pages } => {
+            let api_key = std::env::var("GEMINI_API_KEY").context("GEMINI_API_KEY not found in .env")?;
+            run_index(&db, &api_key, pdf_path, max_depth, min_pages).await?;
+        },
+        Commands::Search { keyword } => {
+            println!("Searching documents for keyword: {}", keyword);
+            let docs = db.search_documents_by_summary(&keyword).await?;
+            
+            if docs.is_empty() {
+                println!("No documents found matching the keyword.");
+            } else {
+                println!("Found {} documents:", docs.len());
+                for doc in docs {
+                    println!("----------------------------------------");
+                    println!("ID: {}", doc.id);
+                    println!("Title: {}", doc.title);
+                    if let Some(file_path) = doc.file_path {
+                        println!("File Path: {}", file_path);
+                    }
+                    if let Some(summary) = doc.overall_summary {
+                        println!("Summary: {}", summary);
+                    }
+                }
+                println!("----------------------------------------");
+            }
+        },
+        Commands::TopNodes { document_id } => {
+            println!("Retrieving top-level nodes for document ID: {}", document_id);
+            let nodes = db.get_top_level_nodes(&[document_id]).await?;
+            
+            if nodes.is_empty() {
+                println!("No top-level nodes found for this document.");
+            } else {
+                println!("Found {} top-level nodes:", nodes.len());
+                for node in nodes {
+                    println!("----------------------------------------");
+                    println!("Node ID: {}", node.node_id);
+                    println!("Title: {}", node.title);
+                    println!("Summary: {}", node.summary);
+                    println!("Has Children: {}", node.has_children);
+                    if node.has_children {
+                        println!("Child IDs: {:?}", node.child_ids.0);
+                    }
+                }
+                println!("----------------------------------------");
+            }
+        }
+    }
 
     Ok(())
 }

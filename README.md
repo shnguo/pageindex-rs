@@ -56,17 +56,33 @@ uv run python main.py
 
 ### 2. Running the Tool (Ingestion)
 
-In a separate terminal, run the tool via Cargo, providing the path to your PDF. This will parse the document, invoke Gemini to generate the hierarchical json forest, send page images to your local OCR server for text extraction, and save the entire tree to `pageindex.db`.
+In a separate terminal, run the tool via Cargo, using the `index` subcommand and providing the path to your PDF. This will parse the document, invoke Gemini to generate the hierarchical json forest, send page images to your local OCR server for text extraction, and save the entire tree to `pageindex.db`.
 
 ```bash
 # Basic usage with default limits (Depth: 3, Min Pages: 5)
-cargo run -- --pdf-path /path/to/your/document.pdf
+cargo run -- index -p /path/to/your/document.pdf
 
 # Override the hard limits
-cargo run -- --pdf-path /path/to/your/document.pdf --max-depth 4 --min-pages 2
+cargo run -- index --pdf-path /path/to/your/document.pdf --max-depth 4 --min-pages 2
 
-# Override the SQLite database output location
-cargo run -- --pdf-path /path/to/paper.pdf --db-url "sqlite:my_custom_index.db?mode=rwc"
+# Override the SQLite database output location (global flag)
+cargo run -- --db-url "sqlite:my_custom_index.db?mode=rwc" index -p /path/to/paper.pdf
+```
+
+### 3. Querying the Index
+
+You can directly interact with the parsed SQLite database using built-in query subcommands:
+
+**Search for Documents:**
+Search across the generated `overall_summary` fields for a specific keyword.
+```bash
+cargo run -- search "your_keyword"
+```
+
+**Get Top-Level Nodes:**
+Retrieve the structural root nodes (table of contents) for a specific document ID.
+```bash
+cargo run -- top-nodes "document_uuid_here"
 ```
 
 ### Downstream RAG Usage

@@ -11,6 +11,7 @@ pub struct DocumentSummary {
     pub file_hash: Option<String>,
 }
 
+#[allow(dead_code)]
 pub enum HashCheckResult {
     Match,
     Mismatch(String), // Returns the old document ID so we can prune it
@@ -45,6 +46,7 @@ impl LibraryIndex {
         Ok(Self { pool })
     }
 
+    #[allow(dead_code)]
     pub async fn init_tables(&self) -> Result<(), sqlx::Error> {
         let sql =
             r#"
@@ -79,6 +81,7 @@ impl LibraryIndex {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn insert_document(
         &self,
         id: &str,
@@ -100,6 +103,7 @@ impl LibraryIndex {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn check_document_hash(
         &self,
         absolute_file_path: &str,
@@ -124,11 +128,13 @@ impl LibraryIndex {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn prune_document(&self, doc_id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM documents WHERE id = ?").bind(doc_id).execute(&self.pool).await?;
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn insert_node(
         &self,
         node_id: &str,
@@ -166,8 +172,20 @@ impl LibraryIndex {
     pub async fn list_documents(&self) -> Result<Vec<DocumentSummary>, sqlx::Error> {
         let docs = sqlx
             ::query_as::<_, DocumentSummary>(
-                "SELECT id, title, overall_summary, file_path FROM documents"
+                "SELECT id, title, overall_summary, file_path, file_hash FROM documents"
             )
+            .fetch_all(&self.pool).await?;
+        Ok(docs)
+    }
+
+    #[allow(dead_code)]
+    pub async fn search_documents_by_summary(&self, keyword: &str) -> Result<Vec<DocumentSummary>, sqlx::Error> {
+        let keyword = format!("%{}%", keyword);
+        let docs = sqlx
+            ::query_as::<_, DocumentSummary>(
+                "SELECT id, title, overall_summary, file_path, file_hash FROM documents WHERE overall_summary LIKE ?"
+            )
+            .bind(keyword)
             .fetch_all(&self.pool).await?;
         Ok(docs)
     }
