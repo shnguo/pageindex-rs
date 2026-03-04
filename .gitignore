@@ -4,3 +4,8 @@
 *.pdf
 output-sample.json
 *.db
+*.pyc
+*.log
+*.dylib
+pageindex.db-shm
+pageindex.db-wal

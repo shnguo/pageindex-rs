@@ -8,8 +8,7 @@ use serde::{ Deserialize, Serialize };
 use std::path::{ Path, PathBuf };
 use sha2::{ Digest, Sha256 };
 use std::fs::File;
-use std::io::{ BufReader, Read };
-
+use std::io::Read;
 mod db;
 use db::{ LibraryIndex, HashCheckResult };
 
@@ -101,6 +100,61 @@ struct CandidatePart {
     text: Option<String>,
 }
 
+#[derive(Serialize)]
+struct OpenAiChatRequest {
+    model: String,
+    messages: Vec<OpenAiMessage>,
+    temperature: f32,
+    response_format: Option<OpenAiResponseFormat>,
+}
+
+#[derive(Serialize)]
+struct OpenAiMessage {
+    role: String,
+    content: Vec<OpenAiContentPart>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type")]
+enum OpenAiContentPart {
+    #[serde(rename = "text")] Text {
+        text: String,
+    },
+    #[serde(rename = "image_url")] ImageUrl {
+        image_url: OpenAiImageUrl,
+    },
+}
+
+#[derive(Serialize)]
+struct OpenAiImageUrl {
+    url: String,
+}
+
+#[derive(Serialize)]
+struct OpenAiResponseFormat {
+    #[serde(rename = "type")]
+    format_type: String,
+    json_schema: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenAiChatResponse {
+    choices: Vec<OpenAiChoice>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenAiChoice {
+    message: OpenAiResponseMessage,
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenAiResponseMessage {
+    content: Option<String>,
+}
+
+use image::ImageFormat;
+use pdfium_render::prelude::*;
+
 /// Helper function to create a new PDF buffer containing only the specified page range.
 /// Note: start_page and end_page are 1-indexed.
 fn extract_pdf_pages(input_path: &Path, start_page: usize, end_page: usize) -> Result<Vec<u8>> {
@@ -138,32 +192,98 @@ fn extract_pdf_pages(input_path: &Path, start_page: usize, end_page: usize) -> R
     Ok(buffer)
 }
 
-/// Extract text for the specified page range.
-fn extract_pdf_text(doc: &Document, start_page: usize, end_page: usize) -> Option<String> {
-    let mut text = String::new();
-    let pages = doc.get_pages();
+fn render_pdf_page_to_jpeg(input_path: &Path, page_number: usize) -> Result<Vec<u8>> {
+    let pdfium = Pdfium::default();
+    let document = pdfium.load_pdf_from_file(input_path, None)?;
+
+    // Pdfium pages are 0-indexed
+    let page = document.pages().get((page_number - 1) as PdfPageIndex)?;
+
+    // Render at 300 DPI for good OCR quality
+    let bitmap = page.render_with_config(&PdfRenderConfig::new().set_target_width(2000))?;
+    let image = bitmap.as_image();
+
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut buffer, ImageFormat::Jpeg)?;
+    Ok(buffer.into_inner())
+}
+
+/// Extract text for the specified page range using local PaddleOCR-VL via MLX.
+// The MLX PaddleOCR-VL server requires images to process, not PDF binaries.
+// We render each requested page of the PDF into a JPEG and attach it to the request.
+async fn extract_pdf_text_via_ocr(
+    client: &Client,
+    input_path: &Path,
+    start_page: usize,
+    end_page: usize
+) -> Result<Option<String>> {
+    let url = "http://127.0.0.1:8080/chat/completions";
+    let mut full_text = String::new();
+    let prompt =
+        "Extract all the text from this document image accurately. Do not output anything else other than the text.";
+
     for page_num in start_page..=end_page {
-        if let Some(_) = pages.get(&(page_num as u32)) {
-            if let Ok(page_text) = doc.extract_text(&[page_num as u32]) {
-                text.push_str(&page_text);
-                text.push('\n');
+        println!("    [OCR] Rendering page {} to JPEG...", page_num);
+        // Render the page to a JPEG buffer
+        let jpeg_bytes = render_pdf_page_to_jpeg(input_path, page_num).context(
+            format!("Failed to render page {} to JPEG", page_num)
+        )?;
+
+        let b64_jpeg = general_purpose::STANDARD.encode(&jpeg_bytes);
+
+        // One page per request for reliability and following MLX server image limits
+        let request_body = OpenAiChatRequest {
+            model: "mlx-community/PaddleOCR-VL-1.5-4bit".to_string(),
+            messages: vec![OpenAiMessage {
+                role: "user".to_string(),
+                content: vec![
+                    OpenAiContentPart::Text { text: prompt.to_string() },
+                    OpenAiContentPart::ImageUrl {
+                        image_url: OpenAiImageUrl {
+                            url: format!("data:image/jpeg;base64,{}", b64_jpeg),
+                        },
+                    }
+                ],
+            }],
+            temperature: 0.0,
+            response_format: None,
+        };
+
+        println!("    [OCR] Sending page {} to local MLX server...", page_num);
+        let res = client
+            .post(url)
+            .json(&request_body)
+            .send().await
+            .context("Failed to send request to OCR API")?;
+
+        if !res.status().is_success() {
+            let error_text = res.text().await?;
+            anyhow::bail!("OCR API request failed: {}", error_text);
+        }
+
+        let response: OpenAiChatResponse = res
+            .json().await
+            .context("Failed to parse OCR response")?;
+        if let Some(choice) = response.choices.first() {
+            if let Some(ref text) = choice.message.content {
+                println!("    [OCR] Successfully extracted text for page {}.", page_num);
+                full_text.push_str(text);
+                full_text.push_str("\n\n");
             }
         }
     }
-    if text.trim().is_empty() {
-        None
-    } else {
-        Some(text)
-    }
+
+    Ok(if full_text.trim().is_empty() { None } else { Some(full_text) })
 }
 
 #[async_recursion]
 async fn insert_nodes_recursively(
+    client: &Client,
     db: &LibraryIndex,
     db_doc_id: &str,
     parent_id: Option<&str>,
     nodes: &[DocumentNode],
-    pdf_doc: &Document
+    pdf_path: &Path
 ) -> Result<(), anyhow::Error> {
     for node in nodes {
         let unique_node_id = format!(
@@ -178,7 +298,18 @@ async fn insert_nodes_recursively(
             .map(|c| format!("{}_{}_{}", db_doc_id, unique_node_id, c.node_id))
             .collect();
 
-        let content = extract_pdf_text(pdf_doc, node.start_index, node.end_index);
+        // Only run OCR extraction if this is a leaf node (no children)
+        let is_leaf = node.nodes.is_empty();
+        let content = if is_leaf {
+            extract_pdf_text_via_ocr(
+                client,
+                pdf_path,
+                node.start_index,
+                node.end_index
+            ).await?
+        } else {
+            None
+        };
 
         db
             .insert_node(
@@ -195,13 +326,14 @@ async fn insert_nodes_recursively(
             ).await
             .context("Failed to insert node")?;
 
-        if !node.nodes.is_empty() {
+        if !is_leaf {
             insert_nodes_recursively(
+                client,
                 db,
                 db_doc_id,
                 Some(&unique_node_id),
                 &node.nodes,
-                pdf_doc
+                pdf_path
             ).await?;
         }
     }
@@ -475,7 +607,7 @@ async fn main() -> Result<()> {
         Some(&absolute_path_str),
         Some(&file_hash)
     ).await?;
-    insert_nodes_recursively(&db, &db_doc_id, None, &root_nodes, &doc).await?;
+    insert_nodes_recursively(&client, &db, &db_doc_id, None, &root_nodes, &args.pdf_path).await?;
     println!("Saved to database successfully.");
 
     Ok(())

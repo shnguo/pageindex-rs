@@ -1,6 +1,6 @@
 # PageIndex Rust (pageindex-rs)
 
-A Rust command-line tool inspired by [VectifyAI/PageIndex](https://github.com/VectifyAI/PageIndex) that extracts the document structure and content of PDF files using Google's Gemini LLM (`gemini-3.1-flash-lite-preview`).
+A Rust command-line tool inspired by [VectifyAI/PageIndex](https://github.com/VectifyAI/PageIndex) that extracts the document structure of PDF files using Google's Gemini LLM (`gemini-3.1-flash-lite-preview`) and performs high-quality text extraction using a local MLX-powered PaddleOCR service.
 
 ## The Architecture: Agentic Tree Search
 
@@ -17,35 +17,46 @@ This system is designed to simulate how a human reads a book:
 To support this low-latency, recursive point-lookup traversal pattern, this project abandons heavy vector databases in favor of a local **SQLite** database (`pageindex.db`).
 
 - Every node in the hierarchy is saved with a `summary` (for the LLM to read during traversal).
-- Every node explicitely stores a JSON array of its immediate `child_ids` so the LLM always knows if it can drill deeper.
-- The actual page content is extracted during the ingestion phase and stored in the `content` column, meaning the Agent can instantly "read" the text without re-parsing the PDF.
+- Every node explicitly stores a JSON array of its immediate `child_ids` so the LLM always knows if it can drill deeper.
+- To save space and processing time, **only leaf nodes** store the actual OCR-extracted text in the `content` column. The Agent can instantly "read" the text of these specific sections without needing to re-parse the PDF.
 
 ## Implemented Features
 
-- **Direct PDF via API Integration**: Reads local PDF files, encodes them in base64, and sends them directly to the Gemini API as `inlineData`.
+- **Direct PDF via API Integration**: Reads local PDF files, encodes them in base64, and sends them directly to the Gemini API as `inlineData` to deduce structural hierarchies.
 - **Hybrid Recursive Chunking**:
   - Analyzes long PDFs by breaking them down recursively based on maximum depth limits.
   - LLM Self-Determination: The model flags if a text block contains distinct subdivisions (`has_children: true`).
-- **In-Memory PDF Slicing with Text Extraction**: Uses the `lopdf` crate to dynamically slice massive PDFs into targeted byte blocks for LLM structure reasoning, while simultaneously extracting the raw text for the SQLite database.
+- **Local Vision-Language Model OCR**: Integrates with a local Python server running `mlx-community/PaddleOCR-VL-1.5-4bit` to perform highly accurate OCR on the leaf nodes. Rust dynamically renders targeted PDF pages into JPEGs using `pdfium-render` and streams them to the local server.
 - **SQLite Persistence & Auto-Pruning**:
   - Automatically provisions and populates a relational database capable of serving advanced multi-agent RAG patterns.
-  - **Auto-Pruning**: Records the absolute path of the source PDF. If an agent attempts to drill down into a document that has been moved or deleted from the server, the database safely self-prunes the entire associated tree to prevent hallucinations.
-  - **Modification Tracking**: Computes the SHA-256 hash of the PDF file before extraction. Unmodified files are instantly skipped to save API costs. Modified files instantly trigger a prune and re-extraction, ensuring perfect synchronization.
+  - **Auto-Pruning**: Records the absolute path of the source PDF. If an agent attempts to drill down into a document that has been modified, the database safely self-prunes the entire associated tree to prevent hallucinations.
+  - **Modification Tracking**: Computes the SHA-256 hash of the PDF file before extraction. Unmodified files are instantly skipped to save API costs and local compute. Modified files instantly trigger a prune and re-extraction, ensuring perfect synchronization.
 
 ## Usage
 
 ### Prerequisites
 
 1. Install Rust and Cargo.
-2. Get a Google Gemini API Key.
-3. Create a `.env` file in the root of the project with your API key:
+2. Install `uv` (Python package manager) for running the local OCR service.
+3. Get a Google Gemini API Key.
+4. Create a `.env` file in the root of the project with your API key:
    ```env
    GEMINI_API_KEY="your_api_key_here"
    ```
 
-### Running the Tool (Ingestion)
+### 1. Start the Local OCR Service
 
-Run the tool via Cargo, providing the path to your PDF. This will parse the document, invoke Gemini to generate the hierarchical json forest, extract the text, and save the entire tree to `pageindex.db`.
+Before running the Rust extraction tool, you must start the MLX-powered PaddleOCR server. This server requires a Mac with Apple Silicon (for MLX support).
+
+```bash
+cd ocr-service
+uv run python main.py
+```
+*(The server will download the model on the first run and bind to `http://0.0.0.0:8080`)*
+
+### 2. Running the Tool (Ingestion)
+
+In a separate terminal, run the tool via Cargo, providing the path to your PDF. This will parse the document, invoke Gemini to generate the hierarchical json forest, send page images to your local OCR server for text extraction, and save the entire tree to `pageindex.db`.
 
 ```bash
 # Basic usage with default limits (Depth: 3, Min Pages: 5)
