@@ -9,6 +9,7 @@ use std::path::{ Path, PathBuf };
 use sha2::{ Digest, Sha256 };
 use std::fs::File;
 use std::io::Read;
+use tracing::info;
 mod db;
 use db::{ LibraryIndex, HashCheckResult };
 
@@ -223,7 +224,7 @@ async fn extract_pdf_text_via_ocr(
         "Extract all the text from this document image accurately. Do not output anything else other than the text.";
 
     for page_num in start_page..=end_page {
-        println!("    [OCR] Rendering page {} to JPEG...", page_num);
+        info!("    [OCR] Rendering page {} to JPEG...", page_num);
         // Render the page to a JPEG buffer
         let jpeg_bytes = render_pdf_page_to_jpeg(input_path, page_num).context(
             format!("Failed to render page {} to JPEG", page_num)
@@ -249,7 +250,7 @@ async fn extract_pdf_text_via_ocr(
             response_format: None,
         };
 
-        println!("    [OCR] Sending page {} to local MLX server...", page_num);
+        info!("    [OCR] Sending page {} to local MLX server...", page_num);
         let res = client
             .post(url)
             .json(&request_body)
@@ -266,7 +267,7 @@ async fn extract_pdf_text_via_ocr(
             .context("Failed to parse OCR response")?;
         if let Some(choice) = response.choices.first() {
             if let Some(ref text) = choice.message.content {
-                println!("    [OCR] Successfully extracted text for page {}.", page_num);
+                info!("    [OCR] Successfully extracted text for page {}.", page_num);
                 full_text.push_str(text);
                 full_text.push_str("\n\n");
             }
@@ -301,12 +302,7 @@ async fn insert_nodes_recursively(
         // Only run OCR extraction if this is a leaf node (no children)
         let is_leaf = node.nodes.is_empty();
         let content = if is_leaf {
-            extract_pdf_text_via_ocr(
-                client,
-                pdf_path,
-                node.start_index,
-                node.end_index
-            ).await?
+            extract_pdf_text_via_ocr(client, pdf_path, node.start_index, node.end_index).await?
         } else {
             None
         };
@@ -321,7 +317,7 @@ async fn insert_nodes_recursively(
                 content.as_deref(),
                 node.start_index as i32,
                 node.end_index as i32,
-                node.has_children.unwrap_or(false),
+                !is_leaf,
                 &child_ids
             ).await
             .context("Failed to insert node")?;
@@ -353,7 +349,7 @@ async fn process_pdf_chunk(
 ) -> Result<Vec<DocumentNode>> {
     let num_pages = (abs_end_page + 1).saturating_sub(abs_start_page);
 
-    println!(
+    info!(
         "{:indent$}Processing chunk: pages {} to {} (Depth: {}, {} pages)",
         "",
         abs_start_page,
@@ -365,7 +361,7 @@ async fn process_pdf_chunk(
 
     // Hard Limit check
     if current_depth >= max_depth {
-        println!(
+        info!(
             "{:indent$}Reached max depth ({}), stopping recursion.",
             "",
             max_depth,
@@ -374,7 +370,7 @@ async fn process_pdf_chunk(
         return Ok(vec![]);
     }
     if num_pages < min_pages && current_depth > 0 {
-        println!(
+        info!(
             "{:indent$}Chunk too small ({} pages < min {}), stopping recursion.",
             "",
             num_pages,
@@ -508,6 +504,16 @@ async fn process_pdf_chunk(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber
+        ::fmt()
+        .with_writer(std::io::stdout)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter
+                ::from_default_env()
+                .add_directive(tracing::Level::INFO.into())
+        )
+        .init();
+
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GEMINI_API_KEY").context("GEMINI_API_KEY not found in .env")?;
 
@@ -525,7 +531,7 @@ async fn main() -> Result<()> {
         Err(_) => args.pdf_path.to_string_lossy().to_string(),
     };
 
-    println!("Calculating SHA-256 hash for document...");
+    info!("Calculating SHA-256 hash for document...");
     let mut file = File::open(&args.pdf_path).context("Failed to open PDF for hashing")?;
     let mut hasher = Sha256::new();
     let mut buffer = [0; 8192];
@@ -537,19 +543,19 @@ async fn main() -> Result<()> {
         hasher.update(&buffer[..count]);
     }
     let file_hash = format!("{:x}", hasher.finalize());
-    println!("Document Hash: {}", file_hash);
+    info!("Document Hash: {}", file_hash);
 
     match db.check_document_hash(&absolute_path_str, &file_hash).await? {
         HashCheckResult::Match => {
-            println!("✅ Document is unchanged. Skipping extraction.");
+            info!("✅ Document is unchanged. Skipping extraction.");
             return Ok(());
         }
         HashCheckResult::Mismatch(old_doc_id) => {
-            println!("🔄 Document has been modified. Pruning old data (ID: {})...", old_doc_id);
+            info!("🔄 Document has been modified. Pruning old data (ID: {})...", old_doc_id);
             db.prune_document(&old_doc_id).await.context("Failed to prune old document")?;
         }
         HashCheckResult::NotFound => {
-            println!("📄 New document detected. Proceeding with extraction.");
+            info!("📄 New document detected. Proceeding with extraction.");
         }
     }
 
@@ -558,8 +564,8 @@ async fn main() -> Result<()> {
     )?;
     let total_pages = doc.get_pages().len();
 
-    println!("Starting recursive extraction on {:?} ({} pages)", args.pdf_path, total_pages);
-    println!("Limits: Max Depth={}, Min Pages={}", args.max_depth, args.min_pages);
+    info!("Starting recursive extraction on {:?} ({} pages)", args.pdf_path, total_pages);
+    info!("Limits: Max Depth={}, Min Pages={}", args.max_depth, args.min_pages);
 
     let client = Client::new();
 
@@ -574,13 +580,13 @@ async fn main() -> Result<()> {
         args.min_pages
     ).await?;
 
-    println!("\n==================================");
-    println!("Extraction Complete!");
-    println!("==================================\n");
+    info!("\n==================================");
+    info!("Extraction Complete!");
+    info!("==================================\n");
     let pretty_json = serde_json::to_string_pretty(&root_nodes)?;
     println!("{}", pretty_json);
 
-    println!("\nSaving to database...");
+    info!("\nSaving to database...");
     let db_doc_id = uuid::Uuid::new_v4().to_string();
     let doc_title = args.pdf_path
         .file_stem()
@@ -608,7 +614,7 @@ async fn main() -> Result<()> {
         Some(&file_hash)
     ).await?;
     insert_nodes_recursively(&client, &db, &db_doc_id, None, &root_nodes, &args.pdf_path).await?;
-    println!("Saved to database successfully.");
+    info!("Saved to database successfully.");
 
     Ok(())
 }

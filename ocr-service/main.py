@@ -8,8 +8,14 @@ import base64
 import json
 import os
 import signal
+import asyncio
+import gc
 
 app = Robyn(__file__)
+
+# Add a global lock to prevent concurrent MLX generation which can crash the GPU driver
+mlx_lock = asyncio.Lock()
+
 
 # Global model and processor
 model = None
@@ -77,17 +83,24 @@ async def chat_completions(request: Request):
             image=images
         )
 
-        print(f"Starting MLX generation for {len(images)} images...", flush=True)
-        # Generate text
-        output = generate(
-            model,
-            processor,
-            formatted_prompt,
-            image=images,
-            max_tokens=body.get("max_tokens", 1000),
-            temperature=body.get("temperature", 0.0),
-        )
-        print("MLX generation complete.", flush=True)
+        print(f"Starting MLX generation for {len(images)} images... waiting for lock", flush=True)
+        async with mlx_lock:
+            print("Acquired MLX lock. Generating...", flush=True)
+            # Generate text
+            output = generate(
+                model,
+                processor,
+                formatted_prompt,
+                image=images,
+                max_tokens=body.get("max_tokens", 1000),
+                temperature=body.get("temperature", 0.0),
+            )
+            print("MLX generation complete.", flush=True)
+
+            del images
+            del formatted_prompt
+            gc.collect()
+            mx.metal.clear_cache()
 
         response_data = {
             "id": "chatcmpl-robyn",

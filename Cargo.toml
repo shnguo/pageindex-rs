@@ -19,3 +19,5 @@ uuid = { version = "1.8", features = ["v4", "fast-rng", "macro-diagnostics"] }
 sha2 = "0.10"
 pdfium-render = "0.8.37"
 image = "0.25.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
