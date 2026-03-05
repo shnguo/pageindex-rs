@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
-use sqlx::{sqlite::SqlitePool, types::Json};
+use serde::{ Deserialize, Serialize };
+use sqlx::{ sqlite::SqlitePool, types::Json };
 
 #[derive(Serialize, Deserialize, sqlx::FromRow, Debug)]
 #[allow(dead_code)]
@@ -63,7 +63,8 @@ impl LibraryIndex {
 
     #[allow(dead_code)]
     pub async fn init_tables(&self) -> Result<(), sqlx::Error> {
-        let sql = r#"
+        let sql =
+            r#"
             CREATE TABLE IF NOT EXISTS documents (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
@@ -92,6 +93,52 @@ impl LibraryIndex {
             CREATE INDEX IF NOT EXISTS idx_nodes_parent ON document_nodes(parent_id);
         "#;
         sqlx::query(sql).execute(&self.pool).await?;
+        // 3. Create FTS5 virtual table for lightning-fast, relevance-ranked searching
+        sqlx
+            ::query(
+                r#"
+            CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+                title,
+                overall_summary,
+                content='documents',
+                content_rowid='rowid'
+            );
+            "#
+            )
+            .execute(&self.pool).await?;
+
+        // 4. Create triggers to automatically keep FTS5 synchronized
+        sqlx
+            ::query(
+                r#"
+            CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN
+              INSERT INTO documents_fts(rowid, title, overall_summary) VALUES (new.rowid, new.title, new.overall_summary);
+            END;
+            "#
+            )
+            .execute(&self.pool).await?;
+
+        sqlx
+            ::query(
+                r#"
+            CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
+              INSERT INTO documents_fts(documents_fts, rowid, title, overall_summary) VALUES ('delete', old.rowid, old.title, old.overall_summary);
+            END;
+            "#
+            )
+            .execute(&self.pool).await?;
+
+        sqlx
+            ::query(
+                r#"
+            CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents BEGIN
+              INSERT INTO documents_fts(documents_fts, rowid, title, overall_summary) VALUES ('delete', old.rowid, old.title, old.overall_summary);
+              INSERT INTO documents_fts(rowid, title, overall_summary) VALUES (new.rowid, new.title, new.overall_summary);
+            END;
+            "#
+            )
+            .execute(&self.pool).await?;
+
         Ok(())
     }
 
@@ -102,7 +149,7 @@ impl LibraryIndex {
         title: &str,
         summary: Option<&str>,
         file_path: Option<&str>,
-        file_hash: Option<&str>,
+        file_hash: Option<&str>
     ) -> Result<(), sqlx::Error> {
         sqlx
             ::query(
@@ -121,14 +168,14 @@ impl LibraryIndex {
     pub async fn check_document_hash(
         &self,
         absolute_file_path: &str,
-        new_hash: &str,
+        new_hash: &str
     ) -> Result<HashCheckResult, sqlx::Error> {
-        let record = sqlx::query_as::<_, (String, Option<String>)>(
-            "SELECT id, file_hash FROM documents WHERE file_path = ?",
-        )
-        .bind(absolute_file_path)
-        .fetch_optional(&self.pool)
-        .await?;
+        let record = sqlx
+            ::query_as::<_, (String, Option<String>)>(
+                "SELECT id, file_hash FROM documents WHERE file_path = ?"
+            )
+            .bind(absolute_file_path)
+            .fetch_optional(&self.pool).await?;
 
         match record {
             Some((id, file_hash)) => {
@@ -144,10 +191,7 @@ impl LibraryIndex {
 
     #[allow(dead_code)]
     pub async fn prune_document(&self, doc_id: &str) -> Result<(), sqlx::Error> {
-        sqlx::query("DELETE FROM documents WHERE id = ?")
-            .bind(doc_id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query("DELETE FROM documents WHERE id = ?").bind(doc_id).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -163,7 +207,7 @@ impl LibraryIndex {
         start_index: i32,
         end_index: i32,
         has_children: bool,
-        child_ids: &[String],
+        child_ids: &[String]
     ) -> Result<(), sqlx::Error> {
         let child_ids_json = serde_json::to_string(child_ids).unwrap_or_else(|_| "[]".to_string());
         sqlx
@@ -187,33 +231,38 @@ impl LibraryIndex {
 
     #[allow(dead_code)]
     pub async fn list_documents(&self) -> Result<Vec<DocumentSummary>, sqlx::Error> {
-        let docs = sqlx::query_as::<_, DocumentSummary>(
-            "SELECT id, title, overall_summary, file_path, file_hash FROM documents",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let docs = sqlx
+            ::query_as::<_, DocumentSummary>(
+                "SELECT id, title, overall_summary, file_path, file_hash FROM documents"
+            )
+            .fetch_all(&self.pool).await?;
         Ok(docs)
     }
 
     #[allow(dead_code)]
     pub async fn search_documents_by_summary(
         &self,
-        keyword: &str,
+        keyword: &str
     ) -> Result<Vec<DocumentSummary>, sqlx::Error> {
-        let keyword = format!("%{}%", keyword);
+        // Basic FTS MATCH query
         let docs = sqlx
             ::query_as::<_, DocumentSummary>(
-                "SELECT id, title, overall_summary, file_path, file_hash FROM documents WHERE overall_summary LIKE ?"
+                r#"
+        SELECT d.id, d.title, d.overall_summary, d.file_path, d.file_hash 
+        FROM documents d 
+        JOIN documents_fts f ON d.rowid = f.rowid 
+        WHERE documents_fts MATCH ? 
+        ORDER BY f.rank
+        "#
             )
             .bind(keyword)
             .fetch_all(&self.pool).await?;
         Ok(docs)
     }
-
     #[allow(dead_code)]
     pub async fn get_top_level_nodes(
         &self,
-        document_ids: &[String],
+        document_ids: &[String]
     ) -> Result<Vec<TraversalNode>, sqlx::Error> {
         if document_ids.is_empty() {
             return Ok(vec![]);
@@ -223,12 +272,10 @@ impl LibraryIndex {
             .map(|_| "?")
             .collect::<Vec<_>>()
             .join(",");
-        let query_str = format!(
-            "SELECT node_id, title, summary, has_children, child_ids 
+        let query_str =
+            format!("SELECT node_id, title, summary, has_children, child_ids 
              FROM document_nodes 
-             WHERE parent_id IS NULL AND document_id IN ({})",
-            ids_str
-        );
+             WHERE parent_id IS NULL AND document_id IN ({})", ids_str);
         let mut query = sqlx::query_as::<_, TraversalNode>(&query_str);
         for id in document_ids {
             query = query.bind(id);
@@ -240,18 +287,20 @@ impl LibraryIndex {
     #[allow(dead_code)]
     pub async fn explore_children(
         &self,
-        node_ids: &[String],
+        node_ids: &[String]
     ) -> Result<Vec<TraversalNode>, sqlx::Error> {
         if node_ids.is_empty() {
             return Ok(vec![]);
         }
-        let ids_str = node_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let query_str = format!(
-            "SELECT node_id, title, summary, has_children, child_ids 
+        let ids_str = node_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let query_str =
+            format!("SELECT node_id, title, summary, has_children, child_ids 
              FROM document_nodes 
-             WHERE parent_id IN ({})",
-            ids_str
-        );
+             WHERE parent_id IN ({})", ids_str);
         let mut query = sqlx::query_as::<_, TraversalNode>(&query_str);
         for id in node_ids {
             query = query.bind(id);
@@ -263,18 +312,20 @@ impl LibraryIndex {
     #[allow(dead_code)]
     pub async fn get_nodes_by_ids(
         &self,
-        node_ids: &[String],
+        node_ids: &[String]
     ) -> Result<Vec<TraversalNode>, sqlx::Error> {
         if node_ids.is_empty() {
             return Ok(vec![]);
         }
-        let ids_str = node_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let query_str = format!(
-            "SELECT node_id, title, summary, has_children, child_ids 
+        let ids_str = node_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let query_str =
+            format!("SELECT node_id, title, summary, has_children, child_ids 
              FROM document_nodes 
-             WHERE node_id IN ({})",
-            ids_str
-        );
+             WHERE node_id IN ({})", ids_str);
         let mut query = sqlx::query_as::<_, TraversalNode>(&query_str);
         for id in node_ids {
             query = query.bind(id);
@@ -286,12 +337,16 @@ impl LibraryIndex {
     #[allow(dead_code)]
     pub async fn get_full_nodes_by_ids(
         &self,
-        node_ids: &[String],
+        node_ids: &[String]
     ) -> Result<Vec<FullDocumentNode>, sqlx::Error> {
         if node_ids.is_empty() {
             return Ok(vec![]);
         }
-        let ids_str = node_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let ids_str = node_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
         let query_str =
             format!("SELECT node_id, document_id, parent_id, title, summary, content, start_index, end_index, has_children, child_ids 
              FROM document_nodes 
@@ -307,7 +362,7 @@ impl LibraryIndex {
     #[allow(dead_code)]
     pub async fn read_node_content(
         &self,
-        node_id: &str,
+        node_id: &str
     ) -> Result<Option<NodeContent>, anyhow::Error> {
         #[derive(sqlx::FromRow)]
         struct JoinedNode {
@@ -319,15 +374,15 @@ impl LibraryIndex {
         }
 
         // First check if the file still exists by joining back to the documents table
-        let record = sqlx::query_as::<_, JoinedNode>(
-            "SELECT d.id as doc_id, d.file_path, n.node_id, n.title, n.content 
+        let record = sqlx
+            ::query_as::<_, JoinedNode>(
+                "SELECT d.id as doc_id, d.file_path, n.node_id, n.title, n.content 
              FROM document_nodes n 
              JOIN documents d ON n.document_id = d.id 
-             WHERE n.node_id = ?",
-        )
-        .bind(node_id)
-        .fetch_optional(&self.pool)
-        .await?;
+             WHERE n.node_id = ?"
+            )
+            .bind(node_id)
+            .fetch_optional(&self.pool).await?;
 
         if let Some(row) = record {
             if let Some(file_path_str) = row.file_path {
@@ -337,22 +392,25 @@ impl LibraryIndex {
                 if !file_path.exists() {
                     println!(
                         "Warning: Associated PDF file {} is missing. Pruning document {} from database.",
-                        file_path_str, row.doc_id
+                        file_path_str,
+                        row.doc_id
                     );
-                    sqlx::query("DELETE FROM documents WHERE id = ?")
+                    sqlx
+                        ::query("DELETE FROM documents WHERE id = ?")
                         .bind(row.doc_id)
-                        .execute(&self.pool)
-                        .await?;
+                        .execute(&self.pool).await?;
 
                     return Ok(None);
                 }
             }
 
-            return Ok(Some(NodeContent {
-                node_id: row.node_id,
-                title: row.title,
-                content: row.content,
-            }));
+            return Ok(
+                Some(NodeContent {
+                    node_id: row.node_id,
+                    title: row.title,
+                    content: row.content,
+                })
+            );
         }
 
         Ok(None)

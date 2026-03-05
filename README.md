@@ -19,6 +19,7 @@ To support this low-latency, recursive point-lookup traversal pattern, this proj
 - Every node in the hierarchy is saved with a `summary` (for the LLM to read during traversal).
 - Every node explicitly stores a JSON array of its immediate `child_ids` so the LLM always knows if it can drill deeper.
 - To save space and processing time, **only leaf nodes** store the actual OCR-extracted text in the `content` column. The Agent can instantly "read" the text of these specific sections without needing to re-parse the PDF.
+- **Full-Text Search (FTS5)**: A companion virtual table (`documents_fts`) is automatically synchronized with the database. This allows downstream agents to leverage high-performance, relevance-ranked `MATCH` queries to rapidly locate matching document nodes.
 
 ## Implemented Features
 
@@ -74,8 +75,8 @@ cargo run -- --db-url "sqlite:my_custom_index.db?mode=rwc" index -p /path/to/pap
 
 You can directly interact with the parsed SQLite database using built-in query subcommands:
 
-**Search for Documents:**
-Search across the generated `overall_summary` fields for a specific keyword.
+**Search for Documents (FTS5):**
+Search across the generated summaries and titles for a specific keyword using optimized SQLite FTS5 relevance ranking.
 
 ```bash
 cargo run -- search "your_keyword"
@@ -103,3 +104,6 @@ To consume this data with an Agent, your downstream application should implement
 1. `list_documents()`: `SELECT id, title, overall_summary FROM documents;`
 2. `explore_children(node_ids)`: `SELECT node_id, title, summary, has_children, child_ids FROM document_nodes WHERE parent_id IN (?);`
 3. `read_content(node_id)`: `SELECT content FROM document_nodes WHERE node_id = ?;`
+4. `search_database(keyword)`: `SELECT ... FROM documents_fts WHERE documents_fts MATCH ... ORDER BY rank`
+
+Alternatively, this project natively defines Agent Skills. For an example of how to plug the search and extraction capabilities into a multi-agent workflow, review `.gemini/skills/pdf-indexer/SKILL.md` and `src/bin/agent.rs`.

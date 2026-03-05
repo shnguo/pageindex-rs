@@ -9,3 +9,5 @@ output-sample.json
 *.dylib
 pageindex.db-shm
 pageindex.db-wal
+.agents
+.gemini/
