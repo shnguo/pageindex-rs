@@ -89,6 +89,13 @@ If a top-level node contains further subdivisions, this command will also seamle
 cargo run -- top-nodes "document_uuid_here"
 ```
 
+**Get Node Details:**
+Retrieve the full details (including content preview and children previews) for one or more specific document nodes by their IDs.
+
+```bash
+cargo run -- nodes "node_uuid_1" "node_uuid_2"
+```
+
 ### Downstream RAG Usage
 
 To consume this data with an Agent, your downstream application should implement three simple tools that query the generated `pageindex.db` file:
