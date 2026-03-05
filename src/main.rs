@@ -1,17 +1,17 @@
-use anyhow::{Context, Result};
+use anyhow::{ Context, Result };
 use async_recursion::async_recursion;
-use base64::{Engine as _, engine::general_purpose};
-use clap::{Parser, Subcommand};
+use base64::{ Engine as _, engine::general_purpose };
+use clap::{ Parser, Subcommand };
 use lopdf::Document;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use serde::{ Deserialize, Serialize };
+use sha2::{ Digest, Sha256 };
 use std::fs::File;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{ Path, PathBuf };
 use tracing::info;
 mod db;
-use db::{HashCheckResult, LibraryIndex};
+use db::{ HashCheckResult, LibraryIndex };
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -37,11 +37,17 @@ enum Commands {
         min_pages: usize,
     },
     /// Search documents by keyword in their summary
-    Search { keyword: String },
+    Search {
+        keyword: String,
+    },
     /// Get top level nodes for a document
-    TopNodes { document_id: String },
+    TopNodes {
+        document_id: String,
+    },
     /// Get details of specific nodes and their children
-    Nodes { node_ids: Vec<String> },
+    Nodes {
+        node_ids: Vec<String>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -74,8 +80,12 @@ struct Content {
 #[derive(Serialize)]
 #[serde(untagged)]
 enum Part {
-    Text { text: String },
-    InlineData { inline_data: InlineData },
+    Text {
+        text: String,
+    },
+    InlineData {
+        inline_data: InlineData,
+    },
 }
 
 #[derive(Serialize)]
@@ -129,10 +139,12 @@ struct OpenAiMessage {
 #[derive(Serialize)]
 #[serde(tag = "type")]
 enum OpenAiContentPart {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "image_url")]
-    ImageUrl { image_url: OpenAiImageUrl },
+    #[serde(rename = "text")] Text {
+        text: String,
+    },
+    #[serde(rename = "image_url")] ImageUrl {
+        image_url: OpenAiImageUrl,
+    },
 }
 
 #[derive(Serialize)]
@@ -181,11 +193,7 @@ fn extract_pdf_pages(input_path: &Path, start_page: usize, end_page: usize) -> R
     }
 
     if pages_to_keep.is_empty() {
-        anyhow::bail!(
-            "No pages found in the specified range ({} - {})",
-            start_page,
-            end_page
-        );
+        anyhow::bail!("No pages found in the specified range ({} - {})", start_page, end_page);
     }
 
     // Alternative approach: delete unwanted pages from the loaded document
@@ -202,9 +210,7 @@ fn extract_pdf_pages(input_path: &Path, start_page: usize, end_page: usize) -> R
     doc_to_modify.delete_pages(&pages_to_delete);
 
     let mut buffer = Vec::new();
-    doc_to_modify
-        .save_to(&mut buffer)
-        .context("Failed to save extracted PDF to buffer")?;
+    doc_to_modify.save_to(&mut buffer).context("Failed to save extracted PDF to buffer")?;
     Ok(buffer)
 }
 
@@ -231,17 +237,19 @@ async fn extract_pdf_text_via_ocr(
     client: &Client,
     input_path: &Path,
     start_page: usize,
-    end_page: usize,
+    end_page: usize
 ) -> Result<Option<String>> {
     let url = "http://127.0.0.1:8080/chat/completions";
     let mut full_text = String::new();
-    let prompt = "Extract all the text from this document image accurately. Do not output anything else other than the text.";
+    let prompt =
+        "Extract all the text from this document image accurately. Do not output anything else other than the text.";
 
     for page_num in start_page..=end_page {
         info!("    [OCR] Rendering page {} to JPEG...", page_num);
         // Render the page to a JPEG buffer
-        let jpeg_bytes = render_pdf_page_to_jpeg(input_path, page_num)
-            .context(format!("Failed to render page {} to JPEG", page_num))?;
+        let jpeg_bytes = render_pdf_page_to_jpeg(input_path, page_num).context(
+            format!("Failed to render page {} to JPEG", page_num)
+        )?;
 
         let b64_jpeg = general_purpose::STANDARD.encode(&jpeg_bytes);
 
@@ -258,7 +266,7 @@ async fn extract_pdf_text_via_ocr(
                         image_url: OpenAiImageUrl {
                             url: format!("data:image/jpeg;base64,{}", b64_jpeg),
                         },
-                    },
+                    }
                 ],
             }],
             temperature: 0.0,
@@ -269,8 +277,7 @@ async fn extract_pdf_text_via_ocr(
         let res = client
             .post(url)
             .json(&request_body)
-            .send()
-            .await
+            .send().await
             .context("Failed to send request to OCR API")?;
 
         if !res.status().is_success() {
@@ -278,25 +285,25 @@ async fn extract_pdf_text_via_ocr(
             anyhow::bail!("OCR API request failed: {}", error_text);
         }
 
-        let response: OpenAiChatResponse =
-            res.json().await.context("Failed to parse OCR response")?;
+        let response: OpenAiChatResponse = res
+            .json().await
+            .context("Failed to parse OCR response")?;
         if let Some(choice) = response.choices.first() {
             if let Some(ref text) = choice.message.content {
-                info!(
-                    "    [OCR] Successfully extracted text for page {}.",
-                    page_num
-                );
+                info!("    [OCR] Successfully extracted text for page {}.", page_num);
                 full_text.push_str(text);
                 full_text.push_str("\n\n");
             }
         }
     }
 
-    Ok(if full_text.trim().is_empty() {
-        None
-    } else {
-        Some(full_text)
-    })
+    Ok(if full_text.trim().is_empty() { None } else { Some(full_text) })
+}
+
+fn generate_node_id(db_doc_id: &str, parent_id: &str, raw_node_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{}_{}_{}", db_doc_id, parent_id, raw_node_id));
+    format!("{:x}", hasher.finalize())
 }
 
 #[async_recursion]
@@ -306,20 +313,18 @@ async fn insert_nodes_recursively(
     db_doc_id: &str,
     parent_id: Option<&str>,
     nodes: &[DocumentNode],
-    pdf_path: &Path,
+    pdf_path: &Path
 ) -> Result<(), anyhow::Error> {
     for node in nodes {
-        let unique_node_id = format!(
-            "{}_{}_{}",
+        let unique_node_id = generate_node_id(
             db_doc_id,
             parent_id.unwrap_or("root"),
-            node.node_id
+            &node.node_id
         );
 
-        let child_ids: Vec<String> = node
-            .nodes
+        let child_ids: Vec<String> = node.nodes
             .iter()
-            .map(|c| format!("{}_{}_{}", db_doc_id, unique_node_id, c.node_id))
+            .map(|c| generate_node_id(db_doc_id, &unique_node_id, &c.node_id))
             .collect();
 
         // Only run OCR extraction if this is a leaf node (no children)
@@ -330,20 +335,20 @@ async fn insert_nodes_recursively(
             None
         };
 
-        db.insert_node(
-            &unique_node_id,
-            db_doc_id,
-            parent_id,
-            &node.title,
-            &node.summary,
-            content.as_deref(),
-            node.start_index as i32,
-            node.end_index as i32,
-            !is_leaf,
-            &child_ids,
-        )
-        .await
-        .context("Failed to insert node")?;
+        db
+            .insert_node(
+                &unique_node_id,
+                db_doc_id,
+                parent_id,
+                &node.title,
+                &node.summary,
+                content.as_deref(),
+                node.start_index as i32,
+                node.end_index as i32,
+                !is_leaf,
+                &child_ids
+            ).await
+            .context("Failed to insert node")?;
 
         if !is_leaf {
             insert_nodes_recursively(
@@ -352,9 +357,8 @@ async fn insert_nodes_recursively(
                 db_doc_id,
                 Some(&unique_node_id),
                 &node.nodes,
-                pdf_path,
-            )
-            .await?;
+                pdf_path
+            ).await?;
         }
     }
     Ok(())
@@ -369,7 +373,7 @@ async fn process_pdf_chunk(
     abs_end_page: usize,
     current_depth: usize,
     max_depth: usize,
-    min_pages: usize,
+    min_pages: usize
 ) -> Result<Vec<DocumentNode>> {
     let num_pages = (abs_end_page + 1).saturating_sub(abs_start_page);
 
@@ -407,10 +411,8 @@ async fn process_pdf_chunk(
     let pdf_bytes = extract_pdf_pages(pdf_path, abs_start_page, abs_end_page)?;
     let b64_pdf = general_purpose::STANDARD.encode(&pdf_bytes);
 
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key={}",
-        api_key
-    );
+    let url =
+        format!("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key={}", api_key);
 
     let prompt = format!(
         "Extract the document structure of this PDF chunk. Output a JSON forest structure, with the top level being a list of nodes. \
@@ -420,7 +422,8 @@ async fn process_pdf_chunk(
         Do not include sub-nodes; just return the top-level subdivisions for this text chunk."
     );
 
-    let schema: serde_json::Value = serde_json::json!({
+    let schema: serde_json::Value =
+        serde_json::json!({
         "type": "ARRAY",
         "description": "A list of document nodes representing the top-level structure of the PDF chunk.",
         "items": {
@@ -446,7 +449,7 @@ async fn process_pdf_chunk(
                         data: b64_pdf,
                     },
                 },
-                Part::Text { text: prompt },
+                Part::Text { text: prompt }
             ],
         }],
         system_instruction: None,
@@ -459,8 +462,7 @@ async fn process_pdf_chunk(
     let res = client
         .post(&url)
         .json(&request_body)
-        .send()
-        .await
+        .send().await
         .context("Failed to send request to Gemini API")?;
 
     if !res.status().is_success() {
@@ -470,8 +472,7 @@ async fn process_pdf_chunk(
 
     let response: GenerateContentResponse = res.json().await.context("Failed to parse response")?;
 
-    let text_content = response
-        .candidates
+    let text_content = response.candidates
         .and_then(|c| c.into_iter().next())
         .and_then(|c| c.content)
         .and_then(|c| c.parts)
@@ -491,8 +492,9 @@ async fn process_pdf_chunk(
         text_content
     };
 
-    let mut nodes: Vec<DocumentNode> =
-        serde_json::from_str(text_content).unwrap_or_else(|_| vec![]);
+    let mut nodes: Vec<DocumentNode> = serde_json
+        ::from_str(text_content)
+        .unwrap_or_else(|_| vec![]);
 
     // Convert relative coordinates to absolute and process children
     for node in nodes.iter_mut() {
@@ -517,9 +519,8 @@ async fn process_pdf_chunk(
                 node.end_index,
                 current_depth + 1,
                 max_depth,
-                min_pages,
-            )
-            .await?;
+                min_pages
+            ).await?;
             node.nodes = child_nodes;
         }
     }
@@ -532,7 +533,7 @@ async fn run_index(
     api_key: &str,
     pdf_path: PathBuf,
     max_depth: usize,
-    min_pages: usize,
+    min_pages: usize
 ) -> Result<()> {
     if !pdf_path.exists() {
         anyhow::bail!("PDF file not found: {:?}", pdf_path);
@@ -557,22 +558,14 @@ async fn run_index(
     let file_hash = format!("{:x}", hasher.finalize());
     info!("Document Hash: {}", file_hash);
 
-    match db
-        .check_document_hash(&absolute_path_str, &file_hash)
-        .await?
-    {
+    match db.check_document_hash(&absolute_path_str, &file_hash).await? {
         HashCheckResult::Match => {
             info!("✅ Document is unchanged. Skipping extraction.");
             return Ok(());
         }
         HashCheckResult::Mismatch(old_doc_id) => {
-            info!(
-                "🔄 Document has been modified. Pruning old data (ID: {})...",
-                old_doc_id
-            );
-            db.prune_document(&old_doc_id)
-                .await
-                .context("Failed to prune old document")?;
+            info!("🔄 Document has been modified. Pruning old data (ID: {})...", old_doc_id);
+            db.prune_document(&old_doc_id).await.context("Failed to prune old document")?;
         }
         HashCheckResult::NotFound => {
             info!("📄 New document detected. Proceeding with extraction.");
@@ -582,10 +575,7 @@ async fn run_index(
     let doc = Document::load(&pdf_path).context("Failed to load PDF to determine total pages")?;
     let total_pages = doc.get_pages().len();
 
-    info!(
-        "Starting recursive extraction on {:?} ({} pages)",
-        pdf_path, total_pages
-    );
+    info!("Starting recursive extraction on {:?} ({} pages)", pdf_path, total_pages);
     info!("Limits: Max Depth={}, Min Pages={}", max_depth, min_pages);
 
     let client = Client::new();
@@ -598,9 +588,8 @@ async fn run_index(
         total_pages,
         0,
         max_depth,
-        min_pages,
-    )
-    .await?;
+        min_pages
+    ).await?;
 
     info!("\n==================================");
     info!("Extraction Complete!");
@@ -622,7 +611,7 @@ async fn run_index(
                 .iter()
                 .map(|n| n.summary.as_str())
                 .collect::<Vec<_>>()
-                .join("\n"),
+                .join("\n")
         )
     } else {
         None
@@ -633,9 +622,8 @@ async fn run_index(
         doc_title,
         overall_summary.as_deref(),
         Some(&absolute_path_str),
-        Some(&file_hash),
-    )
-    .await?;
+        Some(&file_hash)
+    ).await?;
     insert_nodes_recursively(&client, db, &db_doc_id, None, &root_nodes, &pdf_path).await?;
     info!("Saved to database successfully.");
 
@@ -644,11 +632,13 @@ async fn run_index(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
+    tracing_subscriber
+        ::fmt()
         .with_writer(std::io::stdout)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
+            tracing_subscriber::EnvFilter
+                ::from_default_env()
+                .add_directive(tracing::Level::INFO.into())
         )
         .init();
 
@@ -656,21 +646,14 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let db = LibraryIndex::new(&cli.db_url)
-        .await
-        .context("Failed to connect to database")?;
-    db.init_tables()
-        .await
-        .context("Failed to initialize database tables")?;
+    let db = LibraryIndex::new(&cli.db_url).await.context("Failed to connect to database")?;
+    db.init_tables().await.context("Failed to initialize database tables")?;
 
     match cli.command {
-        Commands::Index {
-            pdf_path,
-            max_depth,
-            min_pages,
-        } => {
-            let api_key =
-                std::env::var("GEMINI_API_KEY").context("GEMINI_API_KEY not found in .env")?;
+        Commands::Index { pdf_path, max_depth, min_pages } => {
+            let api_key = std::env
+                ::var("GEMINI_API_KEY")
+                .context("GEMINI_API_KEY not found in .env")?;
             run_index(&db, &api_key, pdf_path, max_depth, min_pages).await?;
         }
         Commands::Search { keyword } => {
@@ -696,10 +679,7 @@ async fn main() -> Result<()> {
             }
         }
         Commands::TopNodes { document_id } => {
-            println!(
-                "Retrieving top-level nodes for document ID: {}",
-                document_id
-            );
+            println!("Retrieving top-level nodes for document ID: {}", document_id);
             let nodes = db.get_top_level_nodes(&[document_id]).await?;
 
             if nodes.is_empty() {
