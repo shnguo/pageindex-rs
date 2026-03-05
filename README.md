@@ -52,7 +52,8 @@ Before running the Rust extraction tool, you must start the MLX-powered PaddleOC
 cd ocr-service
 uv run python main.py
 ```
-*(The server will download the model on the first run and bind to `http://0.0.0.0:8080`)*
+
+_(The server will download the model on the first run and bind to `http://0.0.0.0:8080`)_
 
 ### 2. Running the Tool (Ingestion)
 
@@ -75,12 +76,15 @@ You can directly interact with the parsed SQLite database using built-in query s
 
 **Search for Documents:**
 Search across the generated `overall_summary` fields for a specific keyword.
+
 ```bash
 cargo run -- search "your_keyword"
 ```
 
 **Get Top-Level Nodes:**
 Retrieve the structural root nodes (table of contents) for a specific document ID.
+If a top-level node contains further subdivisions, this command will also seamlessly pre-fetch and display the titles and summaries of its immediate child nodes.
+
 ```bash
 cargo run -- top-nodes "document_uuid_here"
 ```

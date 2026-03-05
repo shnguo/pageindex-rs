@@ -1,7 +1,7 @@
 use anyhow::{ Context, Result };
 use async_recursion::async_recursion;
 use base64::{ engine::general_purpose, Engine as _ };
-use clap::{Parser, Subcommand};
+use clap::{ Parser, Subcommand };
 use lopdf::Document;
 use reqwest::Client;
 use serde::{ Deserialize, Serialize };
@@ -519,7 +519,13 @@ async fn process_pdf_chunk(
     Ok(nodes)
 }
 
-async fn run_index(db: &LibraryIndex, api_key: &str, pdf_path: PathBuf, max_depth: usize, min_pages: usize) -> Result<()> {
+async fn run_index(
+    db: &LibraryIndex,
+    api_key: &str,
+    pdf_path: PathBuf,
+    max_depth: usize,
+    min_pages: usize
+) -> Result<()> {
     if !pdf_path.exists() {
         anyhow::bail!("PDF file not found: {:?}", pdf_path);
     }
@@ -557,9 +563,7 @@ async fn run_index(db: &LibraryIndex, api_key: &str, pdf_path: PathBuf, max_dept
         }
     }
 
-    let doc = Document::load(&pdf_path).context(
-        "Failed to load PDF to determine total pages"
-    )?;
+    let doc = Document::load(&pdf_path).context("Failed to load PDF to determine total pages")?;
     let total_pages = doc.get_pages().len();
 
     info!("Starting recursive extraction on {:?} ({} pages)", pdf_path, total_pages);
@@ -630,7 +634,7 @@ async fn main() -> Result<()> {
         .init();
 
     dotenvy::dotenv().ok();
-    
+
     let cli = Cli::parse();
 
     let db = LibraryIndex::new(&cli.db_url).await.context("Failed to connect to database")?;
@@ -638,13 +642,15 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Index { pdf_path, max_depth, min_pages } => {
-            let api_key = std::env::var("GEMINI_API_KEY").context("GEMINI_API_KEY not found in .env")?;
+            let api_key = std::env
+                ::var("GEMINI_API_KEY")
+                .context("GEMINI_API_KEY not found in .env")?;
             run_index(&db, &api_key, pdf_path, max_depth, min_pages).await?;
-        },
+        }
         Commands::Search { keyword } => {
             println!("Searching documents for keyword: {}", keyword);
             let docs = db.search_documents_by_summary(&keyword).await?;
-            
+
             if docs.is_empty() {
                 println!("No documents found matching the keyword.");
             } else {
@@ -662,11 +668,11 @@ async fn main() -> Result<()> {
                 }
                 println!("----------------------------------------");
             }
-        },
+        }
         Commands::TopNodes { document_id } => {
             println!("Retrieving top-level nodes for document ID: {}", document_id);
             let nodes = db.get_top_level_nodes(&[document_id]).await?;
-            
+
             if nodes.is_empty() {
                 println!("No top-level nodes found for this document.");
             } else {
@@ -679,6 +685,15 @@ async fn main() -> Result<()> {
                     println!("Has Children: {}", node.has_children);
                     if node.has_children {
                         println!("Child IDs: {:?}", node.child_ids.0);
+                        if !node.child_ids.0.is_empty() {
+                            let child_nodes = db.get_nodes_by_ids(&node.child_ids.0).await?;
+                            println!("Child Nodes:");
+                            for child in child_nodes {
+                                println!("  - ID: {}", child.node_id);
+                                println!("    Title: {}", child.title);
+                                println!("    Summary: {}", child.summary);
+                            }
+                        }
                     }
                 }
                 println!("----------------------------------------");

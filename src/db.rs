@@ -179,7 +179,10 @@ impl LibraryIndex {
     }
 
     #[allow(dead_code)]
-    pub async fn search_documents_by_summary(&self, keyword: &str) -> Result<Vec<DocumentSummary>, sqlx::Error> {
+    pub async fn search_documents_by_summary(
+        &self,
+        keyword: &str
+    ) -> Result<Vec<DocumentSummary>, sqlx::Error> {
         let keyword = format!("%{}%", keyword);
         let docs = sqlx
             ::query_as::<_, DocumentSummary>(
@@ -238,6 +241,31 @@ impl LibraryIndex {
         }
         let child_nodes = query.fetch_all(&self.pool).await?;
         Ok(child_nodes)
+    }
+
+    #[allow(dead_code)]
+    pub async fn get_nodes_by_ids(
+        &self,
+        node_ids: &[String]
+    ) -> Result<Vec<TraversalNode>, sqlx::Error> {
+        if node_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let ids_str = node_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let query_str =
+            format!("SELECT node_id, title, summary, has_children, child_ids 
+             FROM document_nodes 
+             WHERE node_id IN ({})", ids_str);
+        let mut query = sqlx::query_as::<_, TraversalNode>(&query_str);
+        for id in node_ids {
+            query = query.bind(id);
+        }
+        let nodes = query.fetch_all(&self.pool).await?;
+        Ok(nodes)
     }
 
     #[allow(dead_code)]
