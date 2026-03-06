@@ -32,6 +32,9 @@ To support this low-latency, recursive point-lookup traversal pattern, this proj
   - Automatically provisions and populates a relational database capable of serving advanced multi-agent RAG patterns.
   - **Auto-Pruning**: Records the absolute path of the source PDF. If an agent attempts to drill down into a document that has been modified, the database safely self-prunes the entire associated tree to prevent hallucinations.
   - **Modification Tracking**: Computes the SHA-256 hash of the PDF file before extraction. Unmodified files are instantly skipped to save API costs and local compute. Modified files instantly trigger a prune and re-extraction, ensuring perfect synchronization.
+- **In-Document Reference Following**: Automatically extracts and resolves internal cross-references (e.g., "see Appendix G"), allowing agents to jump directly to reference targets.
+- **Iterative Multi-Section Retrieval**: Features an advanced prompt loop enabling agents to evaluate progress and visit multiple, distinct sections autonomously to synthesize comprehensive answers.
+- **Image and Table Extraction**: Detects visual elements during ingestion, rendering them to images and utilizing the OCR service to extract tables as Markdown and generate descriptive captions for images/figures.
 
 ## Usage
 
@@ -97,13 +100,36 @@ Retrieve the full details (including content preview and children previews) for 
 cargo run -- nodes "node_uuid_1" "node_uuid_2"
 ```
 
+**Read Leaf Node Content:**
+Read the raw OCR-extracted text of a specific leaf node.
+
+```bash
+cargo run -- read-content "node_uuid"
+```
+
+**Resolve Cross-Reference:**
+Resolve a cross-reference string (e.g., "Appendix G") to its matching section in the document tree.
+
+```bash
+cargo run -- resolve-ref "Appendix G" "document_uuid"
+```
+
+**List Node Assets:**
+List images, tables, and figures associated with a specific document node.
+
+```bash
+cargo run -- list-assets "node_uuid"
+```
+
 ### Downstream RAG Usage
 
-To consume this data with an Agent, your downstream application should implement three simple tools that query the generated `pageindex.db` file:
+To consume this data with an Agent, your downstream application should implement simple tools that query the generated `pageindex.db` file:
 
 1. `list_documents()`: `SELECT id, title, overall_summary FROM documents;`
 2. `explore_children(node_ids)`: `SELECT node_id, title, summary, has_children, child_ids FROM document_nodes WHERE parent_id IN (?);`
 3. `read_content(node_id)`: `SELECT content FROM document_nodes WHERE node_id = ?;`
-4. `search_database(keyword)`: `SELECT ... FROM documents_fts WHERE documents_fts MATCH ... ORDER BY rank`
+4. `search_database(keyword)`: `SELECT ... FROM documents_fts WHERE documents_fts MATCH ... ORDER BY rank;`
+5. `resolve_reference(text, doc_id)`: `SELECT target_node_id FROM node_references...`
+6. `list_assets(node_id)`: `SELECT * FROM node_assets WHERE node_id = ?;`
 
 Alternatively, this project natively defines Agent Skills. For an example of how to plug the search and extraction capabilities into a multi-agent workflow, review `.gemini/skills/pdf-indexer/SKILL.md` and `src/bin/agent.rs`.

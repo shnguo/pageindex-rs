@@ -6,7 +6,7 @@ use lopdf::Document;
 use reqwest::Client;
 use serde::{ Deserialize, Serialize };
 use sha2::{ Digest, Sha256 };
-use std::fs::File;
+use std::fs::{ self, File };
 use std::io::Read;
 use std::path::{ Path, PathBuf };
 use tracing::info;
@@ -48,6 +48,19 @@ enum Commands {
     Nodes {
         node_ids: Vec<String>,
     },
+    /// Read raw content of a specific leaf node
+    ReadContent {
+        node_id: String,
+    },
+    /// Resolve a cross-reference within a document
+    ResolveRef {
+        reference_text: String,
+        document_id: String,
+    },
+    /// List images and tables associated with a node
+    ListAssets {
+        node_id: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -59,6 +72,12 @@ struct DocumentNode {
     summary: String,
     #[serde(default)]
     has_children: Option<bool>,
+    #[serde(default)]
+    has_images: Option<bool>,
+    #[serde(default)]
+    has_tables: Option<bool>,
+    #[serde(default)]
+    references: Vec<String>,
     #[serde(default)]
     nodes: Vec<DocumentNode>,
 }
@@ -300,6 +319,98 @@ async fn extract_pdf_text_via_ocr(
     Ok(if full_text.trim().is_empty() { None } else { Some(full_text) })
 }
 
+/// Extract table content from a pre-rendered JPEG page image via the local OCR service.
+async fn extract_table_text_via_ocr(
+    client: &Client,
+    jpeg_bytes: &[u8]
+) -> Result<Option<String>> {
+    let url = "http://127.0.0.1:8080/chat/completions";
+    let b64_jpeg = general_purpose::STANDARD.encode(jpeg_bytes);
+    let prompt = "Extract all tables from this image as markdown tables. If there are no tables, respond with exactly 'NONE'.";
+
+    let request_body = OpenAiChatRequest {
+        model: "mlx-community/PaddleOCR-VL-1.5-4bit".to_string(),
+        messages: vec![OpenAiMessage {
+            role: "user".to_string(),
+            content: vec![
+                OpenAiContentPart::Text { text: prompt.to_string() },
+                OpenAiContentPart::ImageUrl {
+                    image_url: OpenAiImageUrl {
+                        url: format!("data:image/jpeg;base64,{}", b64_jpeg),
+                    },
+                }
+            ],
+        }],
+        temperature: 0.0,
+        response_format: None,
+    };
+
+    let res = client.post(url).json(&request_body).send().await
+        .context("Failed to send table extraction request")?;
+
+    if !res.status().is_success() {
+        return Ok(None);
+    }
+
+    let response: OpenAiChatResponse = res.json().await
+        .context("Failed to parse table extraction response")?;
+
+    if let Some(choice) = response.choices.first() {
+        if let Some(ref text) = choice.message.content {
+            if text.trim() != "NONE" {
+                return Ok(Some(text.clone()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Extract image/figure descriptions from a pre-rendered JPEG page image via the local OCR service.
+async fn extract_image_description_via_ocr(
+    client: &Client,
+    jpeg_bytes: &[u8]
+) -> Result<Option<String>> {
+    let url = "http://127.0.0.1:8080/chat/completions";
+    let b64_jpeg = general_purpose::STANDARD.encode(jpeg_bytes);
+    let prompt = "Describe each image, figure, chart, or diagram on this page. Include what the visual shows and any labels or captions. If there are no images or figures, respond with exactly 'NONE'.";
+
+    let request_body = OpenAiChatRequest {
+        model: "mlx-community/PaddleOCR-VL-1.5-4bit".to_string(),
+        messages: vec![OpenAiMessage {
+            role: "user".to_string(),
+            content: vec![
+                OpenAiContentPart::Text { text: prompt.to_string() },
+                OpenAiContentPart::ImageUrl {
+                    image_url: OpenAiImageUrl {
+                        url: format!("data:image/jpeg;base64,{}", b64_jpeg),
+                    },
+                }
+            ],
+        }],
+        temperature: 0.0,
+        response_format: None,
+    };
+
+    let res = client.post(url).json(&request_body).send().await
+        .context("Failed to send image description request")?;
+
+    if !res.status().is_success() {
+        return Ok(None);
+    }
+
+    let response: OpenAiChatResponse = res.json().await
+        .context("Failed to parse image description response")?;
+
+    if let Some(choice) = response.choices.first() {
+        if let Some(ref text) = choice.message.content {
+            if text.trim() != "NONE" {
+                return Ok(Some(text.clone()));
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn generate_node_id(db_doc_id: &str, parent_id: &str, raw_node_id: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(format!("{}_{}_{}", db_doc_id, parent_id, raw_node_id));
@@ -313,7 +424,8 @@ async fn insert_nodes_recursively(
     db_doc_id: &str,
     parent_id: Option<&str>,
     nodes: &[DocumentNode],
-    pdf_path: &Path
+    pdf_path: &Path,
+    assets_dir: &Path
 ) -> Result<(), anyhow::Error> {
     for node in nodes {
         let unique_node_id = generate_node_id(
@@ -335,6 +447,9 @@ async fn insert_nodes_recursively(
             None
         };
 
+        let has_images = node.has_images.unwrap_or(false);
+        let has_tables = node.has_tables.unwrap_or(false);
+
         db
             .insert_node(
                 &unique_node_id,
@@ -346,9 +461,67 @@ async fn insert_nodes_recursively(
                 node.start_index as i32,
                 node.end_index as i32,
                 !is_leaf,
+                has_images,
+                has_tables,
                 &child_ids
             ).await
             .context("Failed to insert node")?;
+
+        // Feature 1: Insert cross-references
+        for ref_text in &node.references {
+            db.insert_reference(&unique_node_id, ref_text, db_doc_id).await
+                .context("Failed to insert reference")?;
+        }
+
+        // Feature 3: Extract images/tables for leaf nodes
+        if is_leaf && (has_images || has_tables) {
+            info!("  [Assets] Extracting assets for node '{}' (pages {}-{})", node.title, node.start_index, node.end_index);
+            for page_num in node.start_index..=node.end_index {
+                // Render page to JPEG and save to assets directory
+                match render_pdf_page_to_jpeg(pdf_path, page_num) {
+                    Ok(jpeg_bytes) => {
+                        let asset_filename = format!("{}_{}.jpg", unique_node_id, page_num);
+                        let asset_path = assets_dir.join(&asset_filename);
+                        if let Err(e) = fs::write(&asset_path, &jpeg_bytes) {
+                            info!("  [Assets] Warning: Failed to write asset file: {}", e);
+                            continue;
+                        }
+                        let asset_path_str = asset_path.to_string_lossy().to_string();
+
+                        if has_tables {
+                            // Extract table text via OCR with specialized prompt
+                            let table_text = extract_table_text_via_ocr(client, &jpeg_bytes).await
+                                .unwrap_or(None);
+                            if let Some(ref text) = table_text {
+                                db.insert_asset(
+                                    &unique_node_id, "table",
+                                    Some(&format!("Table from page {}", page_num)),
+                                    Some(page_num as i32),
+                                    Some(&asset_path_str),
+                                    Some(text)
+                                ).await.context("Failed to insert table asset")?;
+                            }
+                        }
+
+                        if has_images {
+                            // Extract image description via OCR with specialized prompt
+                            let description = extract_image_description_via_ocr(client, &jpeg_bytes).await
+                                .unwrap_or(None);
+                            db.insert_asset(
+                                &unique_node_id, "image",
+                                description.as_deref(),
+                                Some(page_num as i32),
+                                Some(&asset_path_str),
+                                None
+                            ).await.context("Failed to insert image asset")?;
+                        }
+                    }
+                    Err(e) => {
+                        info!("  [Assets] Warning: Failed to render page {} to JPEG: {}", page_num, e);
+                    }
+                }
+            }
+        }
 
         if !is_leaf {
             insert_nodes_recursively(
@@ -357,7 +530,8 @@ async fn insert_nodes_recursively(
                 db_doc_id,
                 Some(&unique_node_id),
                 &node.nodes,
-                pdf_path
+                pdf_path,
+                assets_dir
             ).await?;
         }
     }
@@ -417,8 +591,11 @@ async fn process_pdf_chunk(
     let prompt = format!(
         "Extract the document structure of this PDF chunk. Output a JSON forest structure, with the top level being a list of nodes. \
         Each node contains: 'title', 'node_id', 'start_index' (number, RELATIVE starting page in this chunk, where chunk start = 1), \
-        'end_index' (relative ending page), 'summary', and 'has_children'. \
+        'end_index' (relative ending page), 'summary', 'has_children', 'has_images', 'has_tables', and 'references'. \
         Set 'has_children' to true only if this section clearly contains distinct subdivisions. \
+        Set 'has_images' to true if this section contains images, figures, or diagrams. \
+        Set 'has_tables' to true if this section contains data tables. \
+        In 'references', list any cross-references found (e.g. 'Appendix G', 'Table 5.3', 'Section 3.1'). \
         Do not include sub-nodes; just return the top-level subdivisions for this text chunk."
     );
 
@@ -434,9 +611,12 @@ async fn process_pdf_chunk(
                 "start_index": { "type": "INTEGER", "description": "The relative starting page number within this chunk (1-indexed)." },
                 "end_index": { "type": "INTEGER", "description": "The relative ending page number within this chunk." },
                 "summary": { "type": "STRING", "description": "A brief summary of the section's contents." },
-                "has_children": { "type": "BOOLEAN", "description": "True if this section contains further major subdivisions." }
+                "has_children": { "type": "BOOLEAN", "description": "True if this section contains further major subdivisions." },
+                "has_images": { "type": "BOOLEAN", "description": "True if this section contains images, figures, or diagrams." },
+                "has_tables": { "type": "BOOLEAN", "description": "True if this section contains data tables." },
+                "references": { "type": "ARRAY", "items": { "type": "STRING" }, "description": "Cross-references found in this section (e.g. 'Appendix G', 'Table 5.3')." }
             },
-            "required": ["title", "node_id", "start_index", "end_index", "summary", "has_children"]
+            "required": ["title", "node_id", "start_index", "end_index", "summary", "has_children", "has_images", "has_tables", "references"]
         }
     });
 
@@ -624,7 +804,19 @@ async fn run_index(
         Some(&absolute_path_str),
         Some(&file_hash)
     ).await?;
-    insert_nodes_recursively(&client, db, &db_doc_id, None, &root_nodes, &pdf_path).await?;
+
+    // Create assets directory next to the database
+    let assets_dir = PathBuf::from("assets");
+    fs::create_dir_all(&assets_dir).context("Failed to create assets directory")?;
+
+    insert_nodes_recursively(&client, db, &db_doc_id, None, &root_nodes, &pdf_path, &assets_dir).await?;
+
+    // Feature 1: Link cross-references after all nodes are inserted
+    let linked = db.link_references(&db_doc_id).await.unwrap_or(0);
+    if linked > 0 {
+        info!("Linked {} cross-references.", linked);
+    }
+
     info!("Saved to database successfully.");
 
     Ok(())
@@ -745,6 +937,62 @@ async fn main() -> Result<()> {
                     }
                     println!("========================================");
                 }
+            }
+        }
+        Commands::ReadContent { node_id } => {
+            let node_content = db.read_node_content(&node_id).await?;
+            match node_content {
+                Some(nc) => {
+                    println!("Node: {} ({})", nc.title, nc.node_id);
+                    match nc.content {
+                        Some(text) => println!("{}", text),
+                        None => println!("(This node has no raw text content. It may be a parent node — try drilling into its children.)"),
+                    }
+                }
+                None => println!("Node not found or associated file is missing."),
+            }
+        }
+        Commands::ResolveRef { reference_text, document_id } => {
+            println!("Resolving reference '{}' in document {}...", reference_text, document_id);
+            let nodes = db.resolve_reference(&reference_text, &document_id).await?;
+            if nodes.is_empty() {
+                println!("No matching sections found for this reference.");
+            } else {
+                println!("Found {} matching sections:", nodes.len());
+                for node in nodes {
+                    println!("----------------------------------------");
+                    println!("Node ID: {}", node.node_id);
+                    println!("Title: {}", node.title);
+                    println!("Summary: {}", node.summary);
+                    println!("Has Children: {}", node.has_children);
+                }
+                println!("----------------------------------------");
+            }
+        }
+        Commands::ListAssets { node_id } => {
+            println!("Assets for node {}:", node_id);
+            let assets = db.get_assets_for_node(&node_id).await?;
+            if assets.is_empty() {
+                println!("No assets found for this node.");
+            } else {
+                println!("Found {} assets:", assets.len());
+                for asset in assets {
+                    println!("----------------------------------------");
+                    println!("Type: {}", asset.asset_type);
+                    if let Some(desc) = asset.description {
+                        println!("Description: {}", desc);
+                    }
+                    if let Some(page) = asset.page_number {
+                        println!("Page: {}", page);
+                    }
+                    if let Some(path) = asset.file_path {
+                        println!("File: {}", path);
+                    }
+                    if let Some(table) = asset.table_text {
+                        println!("Table Content:\n{}", table);
+                    }
+                }
+                println!("----------------------------------------");
             }
         }
     }

@@ -107,6 +107,29 @@ fn execute_tool(name: &str, args: &Value) -> Value {
                 return serde_json::json!({"error": "Missing 'node_id' argument"});
             }
         }
+        "read_content" => {
+            if let Some(node_id) = args.get("node_id").and_then(|v| v.as_str()) {
+                cmd.arg("read-content").arg(node_id);
+            } else {
+                return serde_json::json!({"error": "Missing 'node_id' argument"});
+            }
+        }
+        "resolve_reference" => {
+            let ref_text = args.get("reference_text").and_then(|v| v.as_str());
+            let doc_id = args.get("document_id").and_then(|v| v.as_str());
+            if let (Some(ref_text), Some(doc_id)) = (ref_text, doc_id) {
+                cmd.arg("resolve-ref").arg(ref_text).arg(doc_id);
+            } else {
+                return serde_json::json!({"error": "Missing 'reference_text' or 'document_id' argument"});
+            }
+        }
+        "list_assets" => {
+            if let Some(node_id) = args.get("node_id").and_then(|v| v.as_str()) {
+                cmd.arg("list-assets").arg(node_id);
+            } else {
+                return serde_json::json!({"error": "Missing 'node_id' argument"});
+            }
+        }
         _ => {
             return serde_json::json!({"error": format!("Unknown tool: {}", name)});
         }
@@ -172,6 +195,42 @@ async fn main() -> Result<()> {
                     "required": ["node_id"]
                 })
                 ),
+            },
+            FunctionDeclaration {
+                name: "read_content".to_string(),
+                description: "Read the raw OCR text content of a specific leaf node. Use this after drill_down identifies a leaf node whose content you want to read in full.".to_string(),
+                parameters: Some(
+                    serde_json::json!({
+                    "type": "OBJECT",
+                    "properties": { "node_id": { "type": "STRING" } },
+                    "required": ["node_id"]
+                })
+                ),
+            },
+            FunctionDeclaration {
+                name: "resolve_reference".to_string(),
+                description: "When the retrieved text mentions a cross-reference (e.g. 'see Appendix G', 'refer to Table 5.3'), use this tool to jump directly to the referenced section. Returns the node_id, title, and summary of the referenced section.".to_string(),
+                parameters: Some(
+                    serde_json::json!({
+                    "type": "OBJECT",
+                    "properties": {
+                        "reference_text": { "type": "STRING", "description": "The reference text, e.g. 'Appendix G'" },
+                        "document_id": { "type": "STRING", "description": "The document to search within" }
+                    },
+                    "required": ["reference_text", "document_id"]
+                })
+                ),
+            },
+            FunctionDeclaration {
+                name: "list_assets".to_string(),
+                description: "List images, figures, and tables associated with a document node. Returns asset type, description, page number, and file path for each asset.".to_string(),
+                parameters: Some(
+                    serde_json::json!({
+                    "type": "OBJECT",
+                    "properties": { "node_id": { "type": "STRING" } },
+                    "required": ["node_id"]
+                })
+                ),
             }
         ],
     }];
@@ -181,16 +240,21 @@ async fn main() -> Result<()> {
             role: "user".to_string(),
             parts: vec![Part {
                 text: Some(
-                    "You are an autonomous document research agent. \
-            Your goal is to find the exact answer to the user's question without asking for permission to continue. \
-            You must follow this workflow: \
+                    "You are an autonomous document research agent. Follow this workflow: \
             1. Use search_library to find relevant documents. \
-            2. Use read_toc to get the root nodes. \
-            3. AUTOMATICALLY and RECURSIVELY call the `drill_down` tool. \
+            2. Use read_toc to get the table of contents (root structural nodes). \
+            3. Evaluate each section's summary and drill_down into the most promising one. \
+            4. After reading a section, ask yourself: 'Do I have enough information to fully answer the question?' \
+               - If YES: formulate your final answer. \
+               - If NO: return to the table of contents and drill_down into another section. \
+            5. You may visit MULTIPLE sections across multiple drill_down calls. Continue until you are confident. \
+            6. When you encounter cross-references like 'see Appendix G' or 'refer to Table 5.3', \
+               use resolve_reference immediately to jump to that section. \
+            7. If you need to understand images, figures, or tables in a section, use list_assets to see what visual elements are available. \
+            8. Use read_content to get the full raw text of any leaf node. \
             CRITICAL: NEVER output intermediate conversational text such as 'I found these sections, which one should I read?'. \
-            You must independently evaluate the summaries, decide which node is most relevant, and immediately execute the `drill_down` tool. \
-            Keep calling `drill_down` until you reach a leaf node with the raw OCR content, or you are certain the answer is not there. \
-            Only output a final text response to the user AFTER you have finished all tool executions.".to_string()
+            You must independently evaluate the summaries, decide which node is most relevant, and immediately execute the appropriate tool. \
+            Only output a final text response to the user AFTER you have finished all tool executions and gathered sufficient information.".to_string()
                 ),
                 ..Default::default()
             }],

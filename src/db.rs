@@ -48,7 +48,31 @@ pub struct FullDocumentNode {
     pub start_index: Option<i32>,
     pub end_index: Option<i32>,
     pub has_children: bool,
+    pub has_images: bool,
+    pub has_tables: bool,
     pub child_ids: Json<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, sqlx::FromRow, Debug)]
+#[allow(dead_code)]
+pub struct NodeReference {
+    pub id: i64,
+    pub source_node_id: String,
+    pub reference_text: String,
+    pub target_node_id: Option<String>,
+    pub document_id: String,
+}
+
+#[derive(Serialize, Deserialize, sqlx::FromRow, Debug)]
+#[allow(dead_code)]
+pub struct NodeAsset {
+    pub id: i64,
+    pub node_id: String,
+    pub asset_type: String,
+    pub description: Option<String>,
+    pub page_number: Option<i32>,
+    pub file_path: Option<String>,
+    pub table_text: Option<String>,
 }
 
 pub struct LibraryIndex {
@@ -86,11 +110,34 @@ impl LibraryIndex {
                 start_index INTEGER,
                 end_index INTEGER,
                 has_children BOOLEAN NOT NULL,
+                has_images BOOLEAN NOT NULL DEFAULT 0,
+                has_tables BOOLEAN NOT NULL DEFAULT 0,
                 child_ids JSON NOT NULL DEFAULT '[]'
+            );
+
+            CREATE TABLE IF NOT EXISTS node_references (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_node_id TEXT NOT NULL REFERENCES document_nodes(node_id) ON DELETE CASCADE,
+                reference_text TEXT NOT NULL,
+                target_node_id TEXT REFERENCES document_nodes(node_id) ON DELETE SET NULL,
+                document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS node_assets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT NOT NULL REFERENCES document_nodes(node_id) ON DELETE CASCADE,
+                asset_type TEXT NOT NULL,
+                description TEXT,
+                page_number INTEGER,
+                file_path TEXT,
+                table_text TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_nodes_doc ON document_nodes(document_id);
             CREATE INDEX IF NOT EXISTS idx_nodes_parent ON document_nodes(parent_id);
+            CREATE INDEX IF NOT EXISTS idx_refs_source ON node_references(source_node_id);
+            CREATE INDEX IF NOT EXISTS idx_refs_doc ON node_references(document_id);
+            CREATE INDEX IF NOT EXISTS idx_assets_node ON node_assets(node_id);
         "#;
         sqlx::query(sql).execute(&self.pool).await?;
         // 3. Create FTS5 virtual table for lightning-fast, relevance-ranked searching
@@ -207,13 +254,15 @@ impl LibraryIndex {
         start_index: i32,
         end_index: i32,
         has_children: bool,
+        has_images: bool,
+        has_tables: bool,
         child_ids: &[String]
     ) -> Result<(), sqlx::Error> {
         let child_ids_json = serde_json::to_string(child_ids).unwrap_or_else(|_| "[]".to_string());
         sqlx
             ::query(
-                "INSERT INTO document_nodes (node_id, document_id, parent_id, title, summary, content, start_index, end_index, has_children, child_ids)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                "INSERT INTO document_nodes (node_id, document_id, parent_id, title, summary, content, start_index, end_index, has_children, has_images, has_tables, child_ids)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             )
             .bind(node_id)
             .bind(document_id)
@@ -224,6 +273,8 @@ impl LibraryIndex {
             .bind(start_index)
             .bind(end_index)
             .bind(has_children)
+            .bind(has_images)
+            .bind(has_tables)
             .bind(child_ids_json)
             .execute(&self.pool).await?;
         Ok(())
@@ -348,7 +399,7 @@ impl LibraryIndex {
             .collect::<Vec<_>>()
             .join(",");
         let query_str =
-            format!("SELECT node_id, document_id, parent_id, title, summary, content, start_index, end_index, has_children, child_ids 
+            format!("SELECT node_id, document_id, parent_id, title, summary, content, start_index, end_index, has_children, has_images, has_tables, child_ids 
              FROM document_nodes 
              WHERE node_id IN ({})", ids_str);
         let mut query = sqlx::query_as::<_, FullDocumentNode>(&query_str);
@@ -414,5 +465,138 @@ impl LibraryIndex {
         }
 
         Ok(None)
+    }
+
+    // -----------------------------------------------------------------------
+    // Feature 1: Reference Following
+    // -----------------------------------------------------------------------
+
+    #[allow(dead_code)]
+    pub async fn insert_reference(
+        &self,
+        source_node_id: &str,
+        reference_text: &str,
+        document_id: &str
+    ) -> Result<(), sqlx::Error> {
+        sqlx
+            ::query(
+                "INSERT INTO node_references (source_node_id, reference_text, document_id) VALUES (?, ?, ?)"
+            )
+            .bind(source_node_id)
+            .bind(reference_text)
+            .bind(document_id)
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Post-ingestion pass: match reference_text against node titles to populate target_node_id
+    #[allow(dead_code)]
+    pub async fn link_references(&self, document_id: &str) -> Result<u64, sqlx::Error> {
+        let result = sqlx
+            ::query(
+                r#"
+                UPDATE node_references
+                SET target_node_id = (
+                    SELECT dn.node_id
+                    FROM document_nodes dn
+                    WHERE dn.document_id = node_references.document_id
+                      AND (dn.title LIKE '%' || node_references.reference_text || '%'
+                           OR node_references.reference_text LIKE '%' || dn.title || '%')
+                    LIMIT 1
+                )
+                WHERE document_id = ? AND target_node_id IS NULL
+                "#
+            )
+            .bind(document_id)
+            .execute(&self.pool).await?;
+        Ok(result.rows_affected())
+    }
+
+    #[allow(dead_code)]
+    pub async fn resolve_reference(
+        &self,
+        reference_text: &str,
+        document_id: &str
+    ) -> Result<Vec<TraversalNode>, sqlx::Error> {
+        // First try the pre-computed reference links
+        let linked_nodes = sqlx
+            ::query_as::<_, TraversalNode>(
+                r#"
+                SELECT dn.node_id, dn.title, dn.summary, dn.has_children, dn.child_ids
+                FROM node_references nr
+                JOIN document_nodes dn ON nr.target_node_id = dn.node_id
+                WHERE nr.document_id = ?
+                  AND (nr.reference_text LIKE '%' || ? || '%'
+                       OR ? LIKE '%' || nr.reference_text || '%')
+                "#
+            )
+            .bind(document_id)
+            .bind(reference_text)
+            .bind(reference_text)
+            .fetch_all(&self.pool).await?;
+
+        if !linked_nodes.is_empty() {
+            return Ok(linked_nodes);
+        }
+
+        // Fallback: direct fuzzy title matching
+        let fallback_nodes = sqlx
+            ::query_as::<_, TraversalNode>(
+                r#"
+                SELECT node_id, title, summary, has_children, child_ids
+                FROM document_nodes
+                WHERE document_id = ?
+                  AND (title LIKE '%' || ? || '%'
+                       OR ? LIKE '%' || title || '%')
+                "#
+            )
+            .bind(document_id)
+            .bind(reference_text)
+            .bind(reference_text)
+            .fetch_all(&self.pool).await?;
+
+        Ok(fallback_nodes)
+    }
+
+    // -----------------------------------------------------------------------
+    // Feature 3: Image/Table Asset Storage
+    // -----------------------------------------------------------------------
+
+    #[allow(dead_code)]
+    pub async fn insert_asset(
+        &self,
+        node_id: &str,
+        asset_type: &str,
+        description: Option<&str>,
+        page_number: Option<i32>,
+        file_path: Option<&str>,
+        table_text: Option<&str>
+    ) -> Result<(), sqlx::Error> {
+        sqlx
+            ::query(
+                "INSERT INTO node_assets (node_id, asset_type, description, page_number, file_path, table_text) VALUES (?, ?, ?, ?, ?, ?)"
+            )
+            .bind(node_id)
+            .bind(asset_type)
+            .bind(description)
+            .bind(page_number)
+            .bind(file_path)
+            .bind(table_text)
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub async fn get_assets_for_node(
+        &self,
+        node_id: &str
+    ) -> Result<Vec<NodeAsset>, sqlx::Error> {
+        let assets = sqlx
+            ::query_as::<_, NodeAsset>(
+                "SELECT id, node_id, asset_type, description, page_number, file_path, table_text FROM node_assets WHERE node_id = ?"
+            )
+            .bind(node_id)
+            .fetch_all(&self.pool).await?;
+        Ok(assets)
     }
 }

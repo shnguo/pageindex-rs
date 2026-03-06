@@ -11,3 +11,4 @@ pageindex.db-shm
 pageindex.db-wal
 .agents
 .gemini/
+assets/
