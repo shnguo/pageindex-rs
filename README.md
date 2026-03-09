@@ -39,7 +39,8 @@ To support this low-latency, recursive point-lookup traversal pattern, this proj
 ## Performance & Reliability
 
 - **Batch PDF Rendering**: Page images for asset extraction are rendered in a single batch, loading the Pdfium engine and PDF document once per node instead of per-page.
-- **Transaction-Batched Writes**: All database inserts during ingestion are wrapped in a single SQLite transaction (`BEGIN IMMEDIATE` / `COMMIT`), with automatic `ROLLBACK` on failure.
+- **Transaction-Batched Writes**: All node, reference, and asset inserts during ingestion are wrapped in a proper sqlx `Transaction`, guaranteeing atomicity with automatic rollback on failure.
+- **Concurrent OCR**: Table extraction and image description OCR run in parallel via `tokio::join!`, roughly halving per-page asset processing time.
 - **WAL Journal Mode**: SQLite runs in Write-Ahead Logging mode for better concurrent read/write throughput.
 - **Retry with Exponential Backoff**: Both Gemini API and local OCR server calls automatically retry on transient failures (network errors, HTTP 429/5xx) with exponential backoff (1s → 2s → 4s, up to 4 attempts). Non-retryable client errors (4xx) fail immediately.
 - **OCR Server Health Check**: The ingestion pipeline verifies the local OCR server is reachable before starting, providing a clear error message if it is not running.

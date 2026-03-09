@@ -1,5 +1,5 @@
 use serde::{ Deserialize, Serialize };
-use sqlx::{ sqlite::SqlitePool, types::Json };
+use sqlx::{ sqlite::SqlitePool, types::Json, Sqlite, Transaction };
 
 #[derive(Serialize, Deserialize, sqlx::FromRow, Debug)]
 #[allow(dead_code)]
@@ -87,6 +87,11 @@ impl LibraryIndex {
             .execute(&pool)
             .await?;
         Ok(Self { pool })
+    }
+
+    /// Begin a new database transaction.
+    pub async fn begin(&self) -> Result<Transaction<'static, Sqlite>, sqlx::Error> {
+        self.pool.begin().await
     }
 
     #[allow(dead_code)]
@@ -327,6 +332,44 @@ impl LibraryIndex {
             .bind(has_tables)
             .bind(child_ids_json)
             .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Insert a node within an existing transaction.
+    pub async fn insert_node_tx(
+        tx: &mut Transaction<'static, Sqlite>,
+        node_id: &str,
+        document_id: &str,
+        parent_id: Option<&str>,
+        title: &str,
+        summary: &str,
+        content: Option<&str>,
+        start_index: i32,
+        end_index: i32,
+        has_children: bool,
+        has_images: bool,
+        has_tables: bool,
+        child_ids: &[String]
+    ) -> Result<(), sqlx::Error> {
+        let child_ids_json = serde_json::to_string(child_ids).unwrap_or_else(|_| "[]".to_string());
+        sqlx
+            ::query(
+                "INSERT INTO document_nodes (node_id, document_id, parent_id, title, summary, content, start_index, end_index, has_children, has_images, has_tables, child_ids)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            )
+            .bind(node_id)
+            .bind(document_id)
+            .bind(parent_id)
+            .bind(title)
+            .bind(summary)
+            .bind(content)
+            .bind(start_index)
+            .bind(end_index)
+            .bind(has_children)
+            .bind(has_images)
+            .bind(has_tables)
+            .bind(child_ids_json)
+            .execute(&mut **tx).await?;
         Ok(())
     }
 
@@ -606,6 +649,24 @@ impl LibraryIndex {
         Ok(())
     }
 
+    /// Insert a reference within an existing transaction.
+    pub async fn insert_reference_tx(
+        tx: &mut Transaction<'static, Sqlite>,
+        source_node_id: &str,
+        reference_text: &str,
+        document_id: &str
+    ) -> Result<(), sqlx::Error> {
+        sqlx
+            ::query(
+                "INSERT INTO node_references (source_node_id, reference_text, document_id) VALUES (?, ?, ?)"
+            )
+            .bind(source_node_id)
+            .bind(reference_text)
+            .bind(document_id)
+            .execute(&mut **tx).await?;
+        Ok(())
+    }
+
     /// Post-ingestion pass: match reference_text against node titles to populate target_node_id
     #[allow(dead_code)]
     pub async fn link_references(&self, document_id: &str) -> Result<u64, sqlx::Error> {
@@ -700,6 +761,30 @@ impl LibraryIndex {
             .bind(file_path)
             .bind(table_text)
             .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Insert an asset within an existing transaction.
+    pub async fn insert_asset_tx(
+        tx: &mut Transaction<'static, Sqlite>,
+        node_id: &str,
+        asset_type: &str,
+        description: Option<&str>,
+        page_number: Option<i32>,
+        file_path: Option<&str>,
+        table_text: Option<&str>
+    ) -> Result<(), sqlx::Error> {
+        sqlx
+            ::query(
+                "INSERT INTO node_assets (node_id, asset_type, description, page_number, file_path, table_text) VALUES (?, ?, ?, ?, ?, ?)"
+            )
+            .bind(node_id)
+            .bind(asset_type)
+            .bind(description)
+            .bind(page_number)
+            .bind(file_path)
+            .bind(table_text)
+            .execute(&mut **tx).await?;
         Ok(())
     }
 

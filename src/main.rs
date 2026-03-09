@@ -12,6 +12,7 @@ use std::path::{ Path, PathBuf };
 use tracing::{info, warn};
 mod db;
 use db::{ HashCheckResult, LibraryIndex };
+use sqlx::{ Sqlite, Transaction };
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -487,7 +488,7 @@ fn generate_node_id(db_doc_id: &str, parent_id: &str, raw_node_id: &str) -> Stri
 #[async_recursion]
 async fn insert_nodes_recursively(
     client: &Client,
-    db: &LibraryIndex,
+    tx: &mut Transaction<'static, Sqlite>,
     db_doc_id: &str,
     parent_id: Option<&str>,
     nodes: &[DocumentNode],
@@ -517,30 +518,30 @@ async fn insert_nodes_recursively(
         let has_images = node.has_images.unwrap_or(false);
         let has_tables = node.has_tables.unwrap_or(false);
 
-        db
-            .insert_node(
-                &unique_node_id,
-                db_doc_id,
-                parent_id,
-                &node.title,
-                &node.summary,
-                content.as_deref(),
-                node.start_index as i32,
-                node.end_index as i32,
-                !is_leaf,
-                has_images,
-                has_tables,
-                &child_ids
-            ).await
+        LibraryIndex::insert_node_tx(
+            tx,
+            &unique_node_id,
+            db_doc_id,
+            parent_id,
+            &node.title,
+            &node.summary,
+            content.as_deref(),
+            node.start_index as i32,
+            node.end_index as i32,
+            !is_leaf,
+            has_images,
+            has_tables,
+            &child_ids
+        ).await
             .context("Failed to insert node")?;
 
-        // Feature 1: Insert cross-references
+        // Insert cross-references
         for ref_text in &node.references {
-            db.insert_reference(&unique_node_id, ref_text, db_doc_id).await
+            LibraryIndex::insert_reference_tx(tx, &unique_node_id, ref_text, db_doc_id).await
                 .context("Failed to insert reference")?;
         }
 
-        // Feature 3: Extract images/tables for leaf nodes (batch-render for efficiency)
+        // Extract images/tables for leaf nodes (batch-render for efficiency)
         if is_leaf && (has_images || has_tables) {
             info!("  [Assets] Extracting assets for node '{}' (pages {}-{})", node.title, node.start_index, node.end_index);
             let rendered_pages = render_pdf_pages_batch(pdf_path, node.start_index..=node.end_index);
@@ -553,26 +554,38 @@ async fn insert_nodes_recursively(
                 }
                 let asset_path_str = asset_path.to_string_lossy().to_string();
 
-                if has_tables {
-                    let table_text = extract_table_text_via_ocr(client, jpeg_bytes).await
-                        .unwrap_or(None);
-                    if let Some(ref text) = table_text {
-                        db.insert_asset(
-                            &unique_node_id, "table",
-                            Some(&format!("Table from page {}", page_num)),
-                            Some(*page_num as i32),
-                            Some(&asset_path_str),
-                            Some(text)
-                        ).await.context("Failed to insert table asset")?;
+                // Run table + image OCR concurrently when both are needed
+                let (table_result, image_result) = tokio::join!(
+                    async {
+                        if has_tables {
+                            extract_table_text_via_ocr(client, jpeg_bytes).await.unwrap_or(None)
+                        } else {
+                            None
+                        }
+                    },
+                    async {
+                        if has_images {
+                            extract_image_description_via_ocr(client, jpeg_bytes).await.unwrap_or(None)
+                        } else {
+                            None
+                        }
                     }
+                );
+
+                if let Some(ref text) = table_result {
+                    LibraryIndex::insert_asset_tx(
+                        tx, &unique_node_id, "table",
+                        Some(&format!("Table from page {}", page_num)),
+                        Some(*page_num as i32),
+                        Some(&asset_path_str),
+                        Some(text)
+                    ).await.context("Failed to insert table asset")?;
                 }
 
                 if has_images {
-                    let description = extract_image_description_via_ocr(client, jpeg_bytes).await
-                        .unwrap_or(None);
-                    db.insert_asset(
-                        &unique_node_id, "image",
-                        description.as_deref(),
+                    LibraryIndex::insert_asset_tx(
+                        tx, &unique_node_id, "image",
+                        image_result.as_deref(),
                         Some(*page_num as i32),
                         Some(&asset_path_str),
                         None
@@ -584,7 +597,7 @@ async fn insert_nodes_recursively(
         if !is_leaf {
             insert_nodes_recursively(
                 client,
-                db,
+                tx,
                 db_doc_id,
                 Some(&unique_node_id),
                 &node.nodes,
@@ -872,46 +885,30 @@ async fn run_index(
         None
     };
 
-    // Wrap all database writes in a single transaction for much faster inserts
-    sqlx::query("BEGIN IMMEDIATE").execute(&db.pool).await
-        .context("Failed to begin transaction")?;
+    // Insert document record (outside transaction — standalone first write)
+    db.insert_document(
+        &db_doc_id,
+        doc_title,
+        overall_summary.as_deref(),
+        Some(&absolute_path_str),
+        Some(&file_hash)
+    ).await.context("Failed to insert document")?;
 
-    let tx_result: Result<()> = async {
-        db.insert_document(
-            &db_doc_id,
-            doc_title,
-            overall_summary.as_deref(),
-            Some(&absolute_path_str),
-            Some(&file_hash)
-        ).await?;
+    // Create assets directory next to the database
+    let assets_dir = PathBuf::from("assets");
+    fs::create_dir_all(&assets_dir).context("Failed to create assets directory")?;
 
-        // Create assets directory next to the database
-        let assets_dir = PathBuf::from("assets");
-        fs::create_dir_all(&assets_dir).context("Failed to create assets directory")?;
+    // Wrap all node/reference/asset inserts in a proper sqlx transaction
+    let mut tx = db.begin().await.context("Failed to begin transaction")?;
+    insert_nodes_recursively(&client, &mut tx, &db_doc_id, None, &root_nodes, &pdf_path, &assets_dir).await
+        .context("Failed to insert nodes (transaction rolled back)")?;
+    tx.commit().await.context("Failed to commit transaction")?;
+    info!("Saved to database successfully.");
 
-        insert_nodes_recursively(&client, db, &db_doc_id, None, &root_nodes, &pdf_path, &assets_dir).await?;
-
-        // Feature 1: Link cross-references after all nodes are inserted
-        let linked = db.link_references(&db_doc_id).await.unwrap_or(0);
-        if linked > 0 {
-            info!("Linked {} cross-references.", linked);
-        }
-
-        Ok(())
-    }.await;
-
-    match tx_result {
-        Ok(()) => {
-            sqlx::query("COMMIT").execute(&db.pool).await
-                .context("Failed to commit transaction")?;
-            info!("Saved to database successfully.");
-        }
-        Err(e) => {
-            warn!("Database writes failed, rolling back: {}", e);
-            sqlx::query("ROLLBACK").execute(&db.pool).await
-                .context("Failed to rollback transaction")?;
-            return Err(e);
-        }
+    // Link cross-references after commit (reads the committed data)
+    let linked = db.link_references(&db_doc_id).await.unwrap_or(0);
+    if linked > 0 {
+        info!("Linked {} cross-references.", linked);
     }
 
     Ok(())
