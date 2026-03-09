@@ -186,6 +186,52 @@ impl LibraryIndex {
             )
             .execute(&self.pool).await?;
 
+        // 5. Create FTS5 virtual table for node-level search (title + summary)
+        sqlx
+            ::query(
+                r#"
+            CREATE VIRTUAL TABLE IF NOT EXISTS document_nodes_fts USING fts5(
+                title,
+                summary,
+                content='document_nodes',
+                content_rowid='rowid'
+            );
+            "#
+            )
+            .execute(&self.pool).await?;
+
+        // 6. Triggers to keep document_nodes_fts synchronized
+        sqlx
+            ::query(
+                r#"
+            CREATE TRIGGER IF NOT EXISTS document_nodes_ai AFTER INSERT ON document_nodes BEGIN
+              INSERT INTO document_nodes_fts(rowid, title, summary) VALUES (new.rowid, new.title, new.summary);
+            END;
+            "#
+            )
+            .execute(&self.pool).await?;
+
+        sqlx
+            ::query(
+                r#"
+            CREATE TRIGGER IF NOT EXISTS document_nodes_ad AFTER DELETE ON document_nodes BEGIN
+              INSERT INTO document_nodes_fts(document_nodes_fts, rowid, title, summary) VALUES ('delete', old.rowid, old.title, old.summary);
+            END;
+            "#
+            )
+            .execute(&self.pool).await?;
+
+        sqlx
+            ::query(
+                r#"
+            CREATE TRIGGER IF NOT EXISTS document_nodes_au AFTER UPDATE ON document_nodes BEGIN
+              INSERT INTO document_nodes_fts(document_nodes_fts, rowid, title, summary) VALUES ('delete', old.rowid, old.title, old.summary);
+              INSERT INTO document_nodes_fts(rowid, title, summary) VALUES (new.rowid, new.title, new.summary);
+            END;
+            "#
+            )
+            .execute(&self.pool).await?;
+
         Ok(())
     }
 
@@ -295,7 +341,8 @@ impl LibraryIndex {
         &self,
         keyword: &str
     ) -> Result<Vec<DocumentSummary>, sqlx::Error> {
-        // Basic FTS MATCH query
+        // FTS MATCH query with prefix expansion for broader matching
+        let fts_keyword = format!("{}*", keyword.trim().replace('"', ""));
         let docs = sqlx
             ::query_as::<_, DocumentSummary>(
                 r#"
@@ -306,9 +353,75 @@ impl LibraryIndex {
         ORDER BY f.rank
         "#
             )
-            .bind(keyword)
+            .bind(&fts_keyword)
             .fetch_all(&self.pool).await?;
         Ok(docs)
+    }
+
+    /// Fallback LIKE search when FTS returns no results
+    #[allow(dead_code)]
+    pub async fn search_documents_fuzzy(
+        &self,
+        keyword: &str
+    ) -> Result<Vec<DocumentSummary>, sqlx::Error> {
+        let like_pattern = format!("%{}%", keyword);
+        let docs = sqlx
+            ::query_as::<_, DocumentSummary>(
+                r#"
+        SELECT id, title, overall_summary, file_path, file_hash
+        FROM documents
+        WHERE title LIKE ? OR overall_summary LIKE ?
+        "#
+            )
+            .bind(&like_pattern)
+            .bind(&like_pattern)
+            .fetch_all(&self.pool).await?;
+        Ok(docs)
+    }
+
+    /// Search across document_nodes using FTS5 with prefix expansion
+    #[allow(dead_code)]
+    pub async fn search_nodes(
+        &self,
+        keyword: &str
+    ) -> Result<Vec<TraversalNode>, sqlx::Error> {
+        let fts_keyword = format!("{}*", keyword.trim().replace('"', ""));
+        let nodes = sqlx
+            ::query_as::<_, TraversalNode>(
+                r#"
+        SELECT dn.node_id, dn.title, dn.summary, dn.has_children, dn.child_ids
+        FROM document_nodes dn
+        JOIN document_nodes_fts f ON dn.rowid = f.rowid
+        WHERE document_nodes_fts MATCH ?
+        ORDER BY f.rank
+        LIMIT 20
+        "#
+            )
+            .bind(&fts_keyword)
+            .fetch_all(&self.pool).await?;
+        Ok(nodes)
+    }
+
+    /// Fallback LIKE search on document_nodes
+    #[allow(dead_code)]
+    pub async fn search_nodes_fuzzy(
+        &self,
+        keyword: &str
+    ) -> Result<Vec<TraversalNode>, sqlx::Error> {
+        let like_pattern = format!("%{}%", keyword);
+        let nodes = sqlx
+            ::query_as::<_, TraversalNode>(
+                r#"
+        SELECT node_id, title, summary, has_children, child_ids
+        FROM document_nodes
+        WHERE title LIKE ? OR summary LIKE ?
+        LIMIT 20
+        "#
+            )
+            .bind(&like_pattern)
+            .bind(&like_pattern)
+            .fetch_all(&self.pool).await?;
+        Ok(nodes)
     }
     #[allow(dead_code)]
     pub async fn get_top_level_nodes(

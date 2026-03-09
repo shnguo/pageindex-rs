@@ -849,25 +849,72 @@ async fn main() -> Result<()> {
             run_index(&db, &api_key, pdf_path, max_depth, min_pages).await?;
         }
         Commands::Search { keyword } => {
-            println!("Searching documents for keyword: {}", keyword);
-            let docs = db.search_documents_by_summary(&keyword).await?;
+            println!("Searching for keyword: {}", keyword);
 
-            if docs.is_empty() {
-                println!("No documents found matching the keyword.");
-            } else {
-                println!("Found {} documents:", docs.len());
-                for doc in docs {
+            // Tier 1: FTS5 on documents (with prefix matching)
+            let docs = db.search_documents_by_summary(&keyword).await?;
+            if !docs.is_empty() {
+                println!("[Document matches] Found {} documents:", docs.len());
+                for doc in &docs {
                     println!("----------------------------------------");
                     println!("ID: {}", doc.id);
                     println!("Title: {}", doc.title);
-                    if let Some(file_path) = doc.file_path {
+                    if let Some(ref file_path) = doc.file_path {
                         println!("File Path: {}", file_path);
                     }
-                    if let Some(summary) = doc.overall_summary {
+                    if let Some(ref summary) = doc.overall_summary {
                         println!("Summary: {}", summary);
                     }
                 }
                 println!("----------------------------------------");
+            }
+
+            // Tier 2: FTS5 on document_nodes (with prefix matching)
+            let nodes = db.search_nodes(&keyword).await?;
+            if !nodes.is_empty() {
+                println!("[Section matches] Found {} matching sections:", nodes.len());
+                for node in &nodes {
+                    println!("----------------------------------------");
+                    println!("Node ID: {}", node.node_id);
+                    println!("Title: {}", node.title);
+                    println!("Summary: {}", node.summary);
+                    println!("Has Children: {}", node.has_children);
+                }
+                println!("----------------------------------------");
+            }
+
+            // Tier 3: LIKE fallback if both FTS tiers returned nothing
+            if docs.is_empty() && nodes.is_empty() {
+                println!("[FTS returned no results, trying fuzzy LIKE fallback...]");
+                let fuzzy_docs = db.search_documents_fuzzy(&keyword).await?;
+                let fuzzy_nodes = db.search_nodes_fuzzy(&keyword).await?;
+
+                if fuzzy_docs.is_empty() && fuzzy_nodes.is_empty() {
+                    println!("No documents or sections found matching the keyword.");
+                } else {
+                    if !fuzzy_docs.is_empty() {
+                        println!("[Fuzzy document matches] Found {} documents:", fuzzy_docs.len());
+                        for doc in &fuzzy_docs {
+                            println!("----------------------------------------");
+                            println!("ID: {}", doc.id);
+                            println!("Title: {}", doc.title);
+                            if let Some(ref summary) = doc.overall_summary {
+                                println!("Summary: {}", summary);
+                            }
+                        }
+                        println!("----------------------------------------");
+                    }
+                    if !fuzzy_nodes.is_empty() {
+                        println!("[Fuzzy section matches] Found {} sections:", fuzzy_nodes.len());
+                        for node in &fuzzy_nodes {
+                            println!("----------------------------------------");
+                            println!("Node ID: {}", node.node_id);
+                            println!("Title: {}", node.title);
+                            println!("Summary: {}", node.summary);
+                        }
+                        println!("----------------------------------------");
+                    }
+                }
             }
         }
         Commands::TopNodes { document_id } => {

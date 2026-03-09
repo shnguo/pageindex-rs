@@ -165,11 +165,11 @@ async fn main() -> Result<()> {
         function_declarations: vec![
             FunctionDeclaration {
                 name: "search_library".to_string(),
-                description: "Search the database for documents matching a keyword.".to_string(),
+                description: "Search the database for documents and sections matching a keyword. Supports prefix matching (e.g. 'optim' matches 'optimization'). Searches both document-level summaries AND section-level titles/summaries. Prefer short, single-word keyword stems for best recall.".to_string(),
                 parameters: Some(
                     serde_json::json!({
                     "type": "OBJECT",
-                    "properties": { "keyword": { "type": "STRING" } },
+                    "properties": { "keyword": { "type": "STRING", "description": "A short keyword or stem to search for. Shorter stems match more broadly." } },
                     "required": ["keyword"]
                 })
                 ),
