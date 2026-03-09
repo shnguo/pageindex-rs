@@ -76,12 +76,16 @@ pub struct NodeAsset {
 }
 
 pub struct LibraryIndex {
-    pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
 }
 
 impl LibraryIndex {
     pub async fn new(db_url: &str) -> Result<Self, sqlx::Error> {
         let pool = SqlitePool::connect(db_url).await?;
+        // Enable WAL mode for better concurrent read/write performance
+        sqlx::query("PRAGMA journal_mode=WAL;")
+            .execute(&pool)
+            .await?;
         Ok(Self { pool })
     }
 

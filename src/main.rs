@@ -9,7 +9,7 @@ use sha2::{ Digest, Sha256 };
 use std::fs::{ self, File };
 use std::io::Read;
 use std::path::{ Path, PathBuf };
-use tracing::info;
+use tracing::{info, warn};
 mod db;
 use db::{ HashCheckResult, LibraryIndex };
 
@@ -199,54 +199,123 @@ use pdfium_render::prelude::*;
 /// Helper function to create a new PDF buffer containing only the specified page range.
 /// Note: start_page and end_page are 1-indexed.
 fn extract_pdf_pages(input_path: &Path, start_page: usize, end_page: usize) -> Result<Vec<u8>> {
-    let doc = Document::load(input_path).context("Failed to load PDF for extraction")?;
+    let mut doc = Document::load(input_path).context("Failed to load PDF for extraction")?;
 
-    // lopdf uses 1-based indexing for page numbers
-    let pages = doc.get_pages();
-    let mut pages_to_keep = vec![];
-
-    for (page_num, object_id) in pages.into_iter() {
-        if (page_num as usize) >= start_page && (page_num as usize) <= end_page {
-            pages_to_keep.push(object_id);
-        }
-    }
-
-    if pages_to_keep.is_empty() {
-        anyhow::bail!("No pages found in the specified range ({} - {})", start_page, end_page);
-    }
-
-    // Alternative approach: delete unwanted pages from the loaded document
-    let mut doc_to_modify = Document::load(input_path)?;
-    let all_pages = doc_to_modify.get_pages();
+    // Collect pages to delete (outside the desired range)
+    let all_pages = doc.get_pages();
     let mut pages_to_delete = vec![];
+    let mut has_pages_in_range = false;
 
     for (page_num, _) in all_pages {
         if (page_num as usize) < start_page || (page_num as usize) > end_page {
             pages_to_delete.push(page_num);
+        } else {
+            has_pages_in_range = true;
         }
     }
 
-    doc_to_modify.delete_pages(&pages_to_delete);
+    if !has_pages_in_range {
+        anyhow::bail!("No pages found in the specified range ({} - {})", start_page, end_page);
+    }
+
+    doc.delete_pages(&pages_to_delete);
 
     let mut buffer = Vec::new();
-    doc_to_modify.save_to(&mut buffer).context("Failed to save extracted PDF to buffer")?;
+    doc.save_to(&mut buffer).context("Failed to save extracted PDF to buffer")?;
     Ok(buffer)
 }
 
+/// Render a single PDF page to JPEG. Loads Pdfium + document each call.
+/// For batch rendering, prefer render_pdf_pages_batch.
 fn render_pdf_page_to_jpeg(input_path: &Path, page_number: usize) -> Result<Vec<u8>> {
     let pdfium = Pdfium::default();
     let document = pdfium.load_pdf_from_file(input_path, None)?;
 
-    // Pdfium pages are 0-indexed
     let page = document.pages().get((page_number - 1) as PdfPageIndex)?;
-
-    // Render at 300 DPI for good OCR quality
     let bitmap = page.render_with_config(&PdfRenderConfig::new().set_target_width(2000))?;
     let image = bitmap.as_image();
 
     let mut buffer = std::io::Cursor::new(Vec::new());
     image.write_to(&mut buffer, ImageFormat::Jpeg)?;
     Ok(buffer.into_inner())
+}
+
+/// Batch-render multiple PDF pages to JPEG, loading Pdfium and the document only once.
+/// Returns a Vec of (page_number, jpeg_bytes) for each successfully rendered page.
+fn render_pdf_pages_batch(input_path: &Path, pages: std::ops::RangeInclusive<usize>) -> Vec<(usize, Vec<u8>)> {
+    let pdfium = Pdfium::default();
+    let document = match pdfium.load_pdf_from_file(input_path, None) {
+        Ok(doc) => doc,
+        Err(e) => {
+            warn!("[Batch Render] Failed to load PDF for batch rendering: {}", e);
+            return vec![];
+        }
+    };
+
+    let mut results = Vec::new();
+    for page_num in pages {
+        match document.pages().get((page_num - 1) as PdfPageIndex) {
+            Ok(page) => {
+                match page.render_with_config(&PdfRenderConfig::new().set_target_width(2000)) {
+                    Ok(bitmap) => {
+                        let image = bitmap.as_image();
+                        let mut buffer = std::io::Cursor::new(Vec::new());
+                        if image.write_to(&mut buffer, ImageFormat::Jpeg).is_ok() {
+                            results.push((page_num, buffer.into_inner()));
+                        }
+                    }
+                    Err(e) => warn!("[Batch Render] Failed to render page {}: {}", page_num, e),
+                }
+            }
+            Err(e) => warn!("[Batch Render] Failed to get page {}: {}", page_num, e),
+        }
+    }
+    results
+}
+
+/// Retry an async HTTP request with exponential backoff.
+/// Retries on transient errors (network, 429, 5xx). Fails immediately on 4xx (except 429).
+async fn send_with_retry(
+    _client: &Client,
+    build_request: impl Fn() -> reqwest::RequestBuilder,
+    context_msg: &str,
+) -> Result<reqwest::Response> {
+    let max_retries = 3u32;
+    let mut last_err = None;
+
+    for attempt in 0..=max_retries {
+        if attempt > 0 {
+            let delay = std::time::Duration::from_secs(1 << (attempt - 1)); // 1s, 2s, 4s
+            warn!("{}: attempt {}/{} after {:?} delay", context_msg, attempt + 1, max_retries + 1, delay);
+            tokio::time::sleep(delay).await;
+        }
+
+        let res = match build_request().send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(format!("Network error: {}", e));
+                continue;
+            }
+        };
+
+        let status = res.status();
+        if status.is_success() {
+            return Ok(res);
+        }
+
+        // Retry on 429 (rate limit) and 5xx (server errors)
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+            last_err = Some(format!("HTTP {}", status));
+            continue;
+        }
+
+        // Non-retryable client error (400, 401, 403, etc.)
+        let error_text = res.text().await.unwrap_or_default();
+        anyhow::bail!("{}: HTTP {} - {}", context_msg, status, error_text);
+    }
+
+    anyhow::bail!("{}: all {} retries exhausted. Last error: {}",
+        context_msg, max_retries + 1, last_err.unwrap_or_default())
 }
 
 /// Extract text for the specified page range using local PaddleOCR-VL via MLX.
@@ -293,16 +362,14 @@ async fn extract_pdf_text_via_ocr(
         };
 
         info!("    [OCR] Sending page {} to local MLX server...", page_num);
-        let res = client
-            .post(url)
-            .json(&request_body)
-            .send().await
-            .context("Failed to send request to OCR API")?;
-
-        if !res.status().is_success() {
-            let error_text = res.text().await?;
-            anyhow::bail!("OCR API request failed: {}", error_text);
-        }
+        let request_body_json = serde_json::to_value(&request_body)
+            .context("Failed to serialize OCR request")?;
+        let ocr_url = url.to_string();
+        let res = send_with_retry(
+            client,
+            || client.post(&ocr_url).json(&request_body_json),
+            &format!("OCR page {}", page_num),
+        ).await?;
 
         let response: OpenAiChatResponse = res
             .json().await
@@ -473,52 +540,43 @@ async fn insert_nodes_recursively(
                 .context("Failed to insert reference")?;
         }
 
-        // Feature 3: Extract images/tables for leaf nodes
+        // Feature 3: Extract images/tables for leaf nodes (batch-render for efficiency)
         if is_leaf && (has_images || has_tables) {
             info!("  [Assets] Extracting assets for node '{}' (pages {}-{})", node.title, node.start_index, node.end_index);
-            for page_num in node.start_index..=node.end_index {
-                // Render page to JPEG and save to assets directory
-                match render_pdf_page_to_jpeg(pdf_path, page_num) {
-                    Ok(jpeg_bytes) => {
-                        let asset_filename = format!("{}_{}.jpg", unique_node_id, page_num);
-                        let asset_path = assets_dir.join(&asset_filename);
-                        if let Err(e) = fs::write(&asset_path, &jpeg_bytes) {
-                            info!("  [Assets] Warning: Failed to write asset file: {}", e);
-                            continue;
-                        }
-                        let asset_path_str = asset_path.to_string_lossy().to_string();
+            let rendered_pages = render_pdf_pages_batch(pdf_path, node.start_index..=node.end_index);
+            for (page_num, jpeg_bytes) in &rendered_pages {
+                let asset_filename = format!("{}_{}.jpg", unique_node_id, page_num);
+                let asset_path = assets_dir.join(&asset_filename);
+                if let Err(e) = fs::write(&asset_path, jpeg_bytes) {
+                    info!("  [Assets] Warning: Failed to write asset file: {}", e);
+                    continue;
+                }
+                let asset_path_str = asset_path.to_string_lossy().to_string();
 
-                        if has_tables {
-                            // Extract table text via OCR with specialized prompt
-                            let table_text = extract_table_text_via_ocr(client, &jpeg_bytes).await
-                                .unwrap_or(None);
-                            if let Some(ref text) = table_text {
-                                db.insert_asset(
-                                    &unique_node_id, "table",
-                                    Some(&format!("Table from page {}", page_num)),
-                                    Some(page_num as i32),
-                                    Some(&asset_path_str),
-                                    Some(text)
-                                ).await.context("Failed to insert table asset")?;
-                            }
-                        }
+                if has_tables {
+                    let table_text = extract_table_text_via_ocr(client, jpeg_bytes).await
+                        .unwrap_or(None);
+                    if let Some(ref text) = table_text {
+                        db.insert_asset(
+                            &unique_node_id, "table",
+                            Some(&format!("Table from page {}", page_num)),
+                            Some(*page_num as i32),
+                            Some(&asset_path_str),
+                            Some(text)
+                        ).await.context("Failed to insert table asset")?;
+                    }
+                }
 
-                        if has_images {
-                            // Extract image description via OCR with specialized prompt
-                            let description = extract_image_description_via_ocr(client, &jpeg_bytes).await
-                                .unwrap_or(None);
-                            db.insert_asset(
-                                &unique_node_id, "image",
-                                description.as_deref(),
-                                Some(page_num as i32),
-                                Some(&asset_path_str),
-                                None
-                            ).await.context("Failed to insert image asset")?;
-                        }
-                    }
-                    Err(e) => {
-                        info!("  [Assets] Warning: Failed to render page {} to JPEG: {}", page_num, e);
-                    }
+                if has_images {
+                    let description = extract_image_description_via_ocr(client, jpeg_bytes).await
+                        .unwrap_or(None);
+                    db.insert_asset(
+                        &unique_node_id, "image",
+                        description.as_deref(),
+                        Some(*page_num as i32),
+                        Some(&asset_path_str),
+                        None
+                    ).await.context("Failed to insert image asset")?;
                 }
             }
         }
@@ -639,16 +697,14 @@ async fn process_pdf_chunk(
         }),
     };
 
-    let res = client
-        .post(&url)
-        .json(&request_body)
-        .send().await
-        .context("Failed to send request to Gemini API")?;
-
-    if !res.status().is_success() {
-        let error_text = res.text().await?;
-        anyhow::bail!("API request failed: {}", error_text);
-    }
+    let request_body_json = serde_json::to_value(&request_body)
+        .context("Failed to serialize Gemini request")?;
+    let gemini_url = url.clone();
+    let res = send_with_retry(
+        client,
+        || client.post(&gemini_url).json(&request_body_json),
+        &format!("Gemini API (pages {}-{})", abs_start_page, abs_end_page),
+    ).await?;
 
     let response: GenerateContentResponse = res.json().await.context("Failed to parse response")?;
 
@@ -672,9 +728,16 @@ async fn process_pdf_chunk(
         text_content
     };
 
-    let mut nodes: Vec<DocumentNode> = serde_json
-        ::from_str(text_content)
-        .unwrap_or_else(|_| vec![]);
+    let mut nodes: Vec<DocumentNode> = match serde_json::from_str(text_content) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            warn!(
+                "Failed to parse Gemini JSON response for pages {}-{}: {}\nRaw response: {}",
+                abs_start_page, abs_end_page, e, text_content
+            );
+            vec![]
+        }
+    };
 
     // Convert relative coordinates to absolute and process children
     for node in nodes.iter_mut() {
@@ -760,6 +823,18 @@ async fn run_index(
 
     let client = Client::new();
 
+    // OCR health check: verify the local OCR server is reachable before starting
+    info!("Checking OCR server availability...");
+    match client.get("http://127.0.0.1:8080/").send().await {
+        Ok(_) => info!("✅ OCR server is reachable."),
+        Err(_) => {
+            anyhow::bail!(
+                "❌ OCR server is not running at http://127.0.0.1:8080.\n\
+                 Please start it first:\n  cd ocr-service && uv run python main.py"
+            );
+        }
+    }
+
     let root_nodes = process_pdf_chunk(
         &client,
         api_key,
@@ -777,7 +852,7 @@ async fn run_index(
     let pretty_json = serde_json::to_string_pretty(&root_nodes)?;
     println!("{}", pretty_json);
 
-    info!("\nSaving to database...");
+    info!("\nSaving to database (inside transaction)...");
     let db_doc_id = uuid::Uuid::new_v4().to_string();
     let doc_title = pdf_path
         .file_stem()
@@ -797,27 +872,47 @@ async fn run_index(
         None
     };
 
-    db.insert_document(
-        &db_doc_id,
-        doc_title,
-        overall_summary.as_deref(),
-        Some(&absolute_path_str),
-        Some(&file_hash)
-    ).await?;
+    // Wrap all database writes in a single transaction for much faster inserts
+    sqlx::query("BEGIN IMMEDIATE").execute(&db.pool).await
+        .context("Failed to begin transaction")?;
 
-    // Create assets directory next to the database
-    let assets_dir = PathBuf::from("assets");
-    fs::create_dir_all(&assets_dir).context("Failed to create assets directory")?;
+    let tx_result: Result<()> = async {
+        db.insert_document(
+            &db_doc_id,
+            doc_title,
+            overall_summary.as_deref(),
+            Some(&absolute_path_str),
+            Some(&file_hash)
+        ).await?;
 
-    insert_nodes_recursively(&client, db, &db_doc_id, None, &root_nodes, &pdf_path, &assets_dir).await?;
+        // Create assets directory next to the database
+        let assets_dir = PathBuf::from("assets");
+        fs::create_dir_all(&assets_dir).context("Failed to create assets directory")?;
 
-    // Feature 1: Link cross-references after all nodes are inserted
-    let linked = db.link_references(&db_doc_id).await.unwrap_or(0);
-    if linked > 0 {
-        info!("Linked {} cross-references.", linked);
+        insert_nodes_recursively(&client, db, &db_doc_id, None, &root_nodes, &pdf_path, &assets_dir).await?;
+
+        // Feature 1: Link cross-references after all nodes are inserted
+        let linked = db.link_references(&db_doc_id).await.unwrap_or(0);
+        if linked > 0 {
+            info!("Linked {} cross-references.", linked);
+        }
+
+        Ok(())
+    }.await;
+
+    match tx_result {
+        Ok(()) => {
+            sqlx::query("COMMIT").execute(&db.pool).await
+                .context("Failed to commit transaction")?;
+            info!("Saved to database successfully.");
+        }
+        Err(e) => {
+            warn!("Database writes failed, rolling back: {}", e);
+            sqlx::query("ROLLBACK").execute(&db.pool).await
+                .context("Failed to rollback transaction")?;
+            return Err(e);
+        }
     }
-
-    info!("Saved to database successfully.");
 
     Ok(())
 }
